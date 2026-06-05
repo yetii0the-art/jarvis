@@ -28,6 +28,44 @@ SB_REST = f"{SUPABASE_URL}/rest/v1"
 STARTING_BALANCE = 50000
 PTS_TO_USD       = 2.0   # $2/pt per MNQ contract
 
+def get_scale(contracts):
+    """Scale-out breakdown: [tp1_contracts, tp2_contracts, tp3_contracts]"""
+    if contracts >= 6: return [2, 2, 2]
+    if contracts == 5: return [2, 2, 1]
+    if contracts == 4: return [2, 1, 1]
+    if contracts == 3: return [1, 1, 1]
+    return [contracts, 0, 0]
+
+def calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, contracts, tp1_hit, tp2_hit, tp3_hit, sl_hit):
+    """Correct P&L with partial closes at each TP."""
+    c1, c2, c3 = get_scale(contracts)
+    sign = 1 if side == "BUY" else -1
+    pnl = 0
+    closed = 0
+    if tp1_hit:
+        pnl   += c1 * sign * (tp1 - entry) * PTS_TO_USD
+        closed += c1
+    if tp2_hit:
+        pnl   += c2 * sign * (tp2 - entry) * PTS_TO_USD
+        closed += c2
+    if tp3_hit:
+        pnl   += c3 * sign * (tp3 - entry) * PTS_TO_USD
+        closed += c3
+    if sl_hit:
+        remaining = contracts - closed
+        pnl += remaining * sign * (sl - entry) * PTS_TO_USD
+    return round(pnl, 2)
+
+def calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit):
+    """Live unrealized P&L on REMAINING contracts."""
+    c1, c2, _ = get_scale(contracts)
+    closed = (c1 if tp1_hit else 0) + (c2 if tp2_hit else 0)
+    remaining = contracts - closed
+    pts = (price - entry) if side == "BUY" else (entry - price)
+    locked = 0
+    # already closed contracts' locked P&L isn't tracked here — just show remaining
+    return round(pts * remaining * PTS_TO_USD, 2), remaining
+
 app = Flask(__name__)
 
 # ── Supabase ──────────────────────────────────────────────────────
@@ -148,13 +186,20 @@ def handle_tg_command(text):
 
         open_str = ""
         for t in stats["open_trades"]:
-            side = t.get("side")
-            entry = t.get("entry", 0)
+            side      = t.get("side")
+            entry     = t.get("entry", 0)
             contracts = t.get("contracts", 5)
+            tp1_hit   = t.get("tp1_hit", False)
+            tp2_hit   = t.get("tp2_hit", False)
+            sl        = t.get("sl", 0)
             if price and entry:
-                pts = (price - entry) if side == "BUY" else (entry - price)
-                live_pnl = round(pts * PTS_TO_USD * contracts, 2)
-                open_str = f"\n📊 Open #{t['id']}: {side} @ {entry}  Live: ${live_pnl:+,.2f}"
+                unreal, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
+                c1, c2, _ = get_scale(contracts)
+                locked = (c1*50*PTS_TO_USD if tp1_hit else 0) + (c2*75*PTS_TO_USD if tp2_hit else 0)
+                total  = round(locked + unreal, 2)
+                be_str = " | SL@BE" if tp2_hit else ""
+                open_str = (f"\n📊 Open #{t['id']}: {side} {contracts}MNQ @ {entry}{be_str}\n"
+                            f"   Unrealized: ${unreal:+,.2f}  |  Total: ${total:+,.2f}  ({remaining} MNQ open)")
 
         tg_send(
             f"<b>Jarvis Status</b>\n\n"
@@ -184,7 +229,10 @@ def handle_tg_command(text):
         tp2_hit   = t.get("tp2_hit", False)
 
         pts = (price - entry) if side == "BUY" else (entry - price)
-        pnl_usd = round(pts * PTS_TO_USD * contracts, 2)
+        unreal_usd, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
+        c1, c2, c3 = get_scale(contracts)
+        locked_usd = (c1 * 50 * PTS_TO_USD if tp1_hit else 0) + (c2 * 75 * PTS_TO_USD if tp2_hit else 0)
+        total_usd  = round(locked_usd + unreal_usd, 2)
 
         # Distance to each level
         dist_sl  = abs(price - sl)
@@ -211,17 +259,19 @@ def handle_tg_command(text):
         tp2_str = "✅ (SL @ BE)" if tp2_hit else f"<code>{tp2}</code> ({dist_tp2:.0f}pts away)"
         tp3_str = f"<code>{tp3}</code> ({dist_tp3:.0f}pts away)"
 
+        locked_str = f"  (${locked_usd:+.0f} locked)" if locked_usd else ""
         tg_send(
             f"📊 <b>Trade #{t['id']} — {status}</b>\n\n"
             f"{side} {contracts}MNQ  |  Entry: <code>{entry}</code>\n"
-            f"Live price: <code>{price:,.2f}</code>\n\n"
+            f"Price: <code>{price:,.2f}</code>  ({remaining} MNQ remaining)\n\n"
             f"[{bar}] {pct}%\n"
             f"SL {'(BE)' if tp2_hit else ''} ←————————→ TP3\n\n"
-            f"P&L: <b>{'+'if pts>=0 else ''}{round(pts)}pts  |  ${pnl_usd:+,.2f}</b>\n\n"
+            f"Unrealized: <b>${unreal_usd:+,.2f}</b>{locked_str}\n"
+            f"Total P&L:  <b>${total_usd:+,.2f}</b>\n\n"
             f"TP1: {tp1_str}\n"
             f"TP2: {tp2_str}\n"
             f"TP3: {tp3_str}\n"
-            f"SL:  <code>{sl}</code> ({dist_sl:.0f}pts away)"
+            f"SL:  <code>{sl}</code>  ({dist_sl:.0f}pts away)"
         )
 
     elif cmd in ("/recap", "recap", "stats", "how we doing", "performance"):
@@ -621,7 +671,8 @@ def check_open_jarvis_trades():
                 result="LOSS"; slh=True; pts=entry-sl
 
         if result:
-            pnl_usd = round(pts * PTS_TO_USD * contracts, 2)
+            pnl_usd = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, contracts,
+                                       bool(tp1h), bool(tp2h), bool(tp3h), bool(slh))
             sb_update("trades", trade["id"], {
                 "result": result, "tp1_hit": bool(tp1h), "tp2_hit": bool(tp2h),
                 "tp3_hit": bool(tp3h), "sl_hit": bool(slh),
@@ -783,8 +834,12 @@ def auto_enter_trade(signal):
     if not logged:
         return
 
-    risk_usd = round(40 * PTS_TO_USD * signal["contracts"])
-    tp3_usd  = round(125 * PTS_TO_USD * signal["contracts"])
+    c1, c2, c3 = get_scale(signal["contracts"])
+    risk_usd = round(40  * PTS_TO_USD * signal["contracts"])
+    tp1_usd  = round(50  * PTS_TO_USD * c1)
+    tp2_usd  = round(75  * PTS_TO_USD * c2)
+    tp3_usd  = round(125 * PTS_TO_USD * c3)
+    max_usd  = tp1_usd + tp2_usd + tp3_usd
     side_emoji = "🟢" if signal["side"] == "BUY" else "🔴"
     session_wr = 64 if signal["session"] == "Overnight" else 52 if signal["session"] == "London" else 59
 
@@ -801,10 +856,11 @@ def auto_enter_trade(signal):
     tg_send(
         f"{side_emoji} <b>JARVIS ENTERED — #{logged['id']}</b>\n\n"
         f"<b>{signal['side']} {signal['contracts']} MNQ</b> @ <code>{signal['entry']}</code>\n\n"
-        f"SL:  <code>{signal['sl']}</code>  (−${risk_usd})\n"
-        f"TP1: <code>{signal['tp1']}</code>  (+${round(50*PTS_TO_USD*signal['contracts'])})\n"
-        f"TP2: <code>{signal['tp2']}</code>  (+${round(75*PTS_TO_USD*signal['contracts'])})  ← SL moves to BE\n"
-        f"TP3: <code>{signal['tp3']}</code>  (+${tp3_usd})\n\n"
+        f"SL:  <code>{signal['sl']}</code>  (−${risk_usd})  [{signal['contracts']} MNQ]\n"
+        f"TP1: <code>{signal['tp1']}</code>  close {c1} MNQ → +${tp1_usd}\n"
+        f"TP2: <code>{signal['tp2']}</code>  close {c2} MNQ → +${tp2_usd}  ← SL to BE\n"
+        f"TP3: <code>{signal['tp3']}</code>  close {c3} MNQ → +${tp3_usd}\n"
+        f"Max profit: <b>+${max_usd}</b>\n\n"
         f"📊 {signal['session']} | {session_wr}% WR hist | {signal['conviction']} conviction\n"
         f"💡 {'Dip entry — trend UP, bought pullback' if signal['side'] == 'BUY' else 'Fade — trend DOWN, sold push'}\n"
         + (f"{form_str}\n" if form_str else "") +
@@ -879,7 +935,8 @@ def check_open_jarvis_trades():
                 result="LOSS"; slh=True; pts=entry-sl
 
         if result:
-            pnl_usd = round(pts * PTS_TO_USD * contracts, 2)
+            pnl_usd = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, contracts,
+                                       bool(tp1h), bool(tp2h), bool(tp3h), bool(slh))
             sb_update("trades", trade["id"], {
                 "result": result, "tp1_hit": bool(tp1h), "tp2_hit": bool(tp2h),
                 "tp3_hit": bool(tp3h), "sl_hit": bool(slh),
@@ -945,11 +1002,51 @@ def send_daily_recap():
         f"Account: ${STARTING_BALANCE + all_pnl:,.2f}"
     )
 
+def send_progress_chime():
+    """Periodic trade update — fires every ~20min while trade is open."""
+    open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
+    if not open_trades:
+        return
+    t = open_trades[0]
+    price     = get_live_price()
+    if not price: return
+    side      = t["side"]
+    entry     = t["entry"]
+    sl        = t["sl"]
+    tp1       = t["tp1"]
+    tp2       = t["tp2"]
+    tp3       = t["tp3"]
+    contracts = t.get("contracts", 5)
+    tp1_hit   = t.get("tp1_hit", False)
+    tp2_hit   = t.get("tp2_hit", False)
+    c1, c2, c3 = get_scale(contracts)
+
+    pts = (price - entry) if side == "BUY" else (entry - price)
+    unreal, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
+    locked = (c1*50*PTS_TO_USD if tp1_hit else 0) + (c2*75*PTS_TO_USD if tp2_hit else 0)
+    total  = round(locked + unreal, 2)
+
+    dist_tp2 = round(abs(price - tp2), 1)
+    dist_tp3 = round(abs(price - tp3), 1)
+    dist_sl  = round(abs(price - sl), 1)
+
+    emoji = "🟢" if pts > 0 else "🔴"
+    next_target = f"TP3 {dist_tp3}pts away" if tp2_hit else f"TP2 {dist_tp2}pts away" if tp1_hit else f"TP1 {round(abs(price-tp1),1)}pts away"
+
+    tg_send(
+        f"{emoji} <b>Trade #{t['id']} update</b>\n\n"
+        f"{side} {contracts}MNQ  |  <code>{price:,.2f}</code>\n"
+        f"P&L: <b>${total:+,.2f}</b>  ({remaining} MNQ open)\n"
+        f"Next: {next_target}  |  SL {dist_sl}pts away\n\n"
+        f"/progress for full breakdown"
+    )
+
 def background_monitor():
     """Every 30s: auto-enter trades when signal fires, monitor open positions."""
     last_signal_price = None
     last_signal_time  = 0
     last_recap_day    = None
+    last_chime_time   = 0
 
     while True:
         try:
@@ -967,6 +1064,12 @@ def background_monitor():
                     auto_enter_trade(signal)
                     last_signal_price = price
                     last_signal_time  = now
+
+            # Periodic chime every 20min on open trade
+            open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
+            if open_trades and time.time() - last_chime_time > 1200:
+                send_progress_chime()
+                last_chime_time = time.time()
 
             # Daily recap at 4pm ET
             now_dt = datetime.now()
