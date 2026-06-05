@@ -130,6 +130,7 @@ def tg_get_updates():
 COMMANDS = {
     "📡 Market": [
         ("/price",    "Live MNQM6 price + session + pre-trend"),
+        ("/analysis", "Full market read — what Jarvis sees + what it needs for a setup"),
         ("/status",   "Full status: balance, record, open trade P&L"),
     ],
     "📊 Active Trade": [
@@ -330,6 +331,10 @@ def handle_tg_command(text):
                 f"<code>/gm SELL 5 30185 30095 30070 30020 30225</code>\n"
                 f"(side, contracts, entry, tp1, tp2, tp3, sl)"
             )
+
+    # ── /analysis ─────────────────────────────────────────────────
+    elif any(w in text for w in ["/analysis", "analysis", "analyze", "read", "market", "outlook", "what you seeing", "what do you see", "where we going", "where going"]):
+        send_market_analysis()
 
     # ── /help ──────────────────────────────────────────────────────
     elif any(w in text for w in ["/help", "help", "?", "commands"]):
@@ -944,6 +949,128 @@ def check_open_jarvis_trades():
                     f"Part of the game. Back to watching."
                 )
             tg_send(msg)
+
+def send_market_analysis():
+    """Full market read — what Jarvis sees right now, where it thinks price goes, what it needs for a setup."""
+    price        = get_live_price()
+    candles      = get_15min_candles()
+    session_name, session_ok = get_session()
+    pre_trend    = get_pretend(candles)
+    strength     = get_trend_strength(candles)
+    bias         = get_directional_bias()
+
+    if not price or len(candles) < 6:
+        tg_send("Not enough data yet — still warming up.")
+        return
+
+    # Bigger trend (20 candles = ~5hrs of 15min bars)
+    long_closes = [c["c"] for c in candles[-20:]] if len(candles) >= 20 else [c["c"] for c in candles]
+    long_trend  = "DOWN" if long_closes[-1] < long_closes[0] else "UP"
+    long_move   = round(long_closes[-1] - long_closes[0], 1)
+
+    # Medium trend (10 candles = ~2.5hrs)
+    mid_closes  = [c["c"] for c in candles[-10:]] if len(candles) >= 10 else [c["c"] for c in candles]
+    mid_trend   = "DOWN" if mid_closes[-1] < mid_closes[0] else "UP"
+    mid_move    = round(mid_closes[-1] - mid_closes[0], 1)
+
+    # Short (last 3 candles = ~45min)
+    short_closes = [c["c"] for c in candles[-3:]]
+    short_trend  = "DOWN" if short_closes[-1] < short_closes[0] else "UP"
+    short_move   = round(short_closes[-1] - short_closes[0], 1)
+
+    # Key levels — recent highs/lows
+    recent_high = round(max(c["h"] for c in candles[-20:]), 1)
+    recent_low  = round(min(c["l"] for c in candles[-20:]), 1)
+    range_size  = round(recent_high - recent_low, 1)
+    range_pct   = round((price - recent_low) / range_size * 100) if range_size > 0 else 50
+
+    # Where price is in the range
+    if range_pct >= 75:
+        range_pos = f"near top of range ({range_pct}%)"
+    elif range_pct <= 25:
+        range_pos = f"near bottom of range ({range_pct}%)"
+    else:
+        range_pos = f"mid-range ({range_pct}%)"
+
+    # Signal readiness
+    open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
+    in_trade = bool(open_trades)
+
+    # What would trigger a setup
+    if in_trade:
+        setup_needed = f"Already in trade #{open_trades[0]['id']} — not looking for new entry"
+    elif not session_ok:
+        setup_needed = f"NY session — sitting out. Next window: Overnight starts ~5pm ET"
+    else:
+        if pre_trend == "DOWN" and long_trend == "UP":
+            setup_needed = "✅ BUY setup conditions met — pre-trend dip in uptrend. Could fire now."
+        elif pre_trend == "UP" and long_trend == "DOWN":
+            setup_needed = "✅ SELL setup conditions met — push into downtrend. Could fire now."
+        elif pre_trend == "DOWN" and long_trend == "DOWN":
+            setup_needed = "✅ SELL continuation conditions met — trending down. Could fire now."
+        elif pre_trend == "UP" and long_trend == "UP":
+            setup_needed = "✅ BUY continuation conditions met — trending up. Could fire now."
+        elif strength < 10:
+            setup_needed = f"Pre-trend too weak ({strength:.0f}pts) — need at least 10pts of directional move on 15min"
+        else:
+            setup_needed = f"Pre-trend {pre_trend} but need a cleaner directional read"
+
+    # Bias context
+    bias_str = f"\n🔄 <b>Recent bias: {bias}</b> — last 4/5 trades same direction" if bias else ""
+
+    # Build the AI analysis if we have the key
+    ai_read = ""
+    if ANTHROPIC_KEY:
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            candle_summary = f"Last 6 closes (15min): {[round(c['c'],1) for c in candles[-6:]]}"
+            msg = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=200,
+                messages=[{
+                    "role": "user",
+                    "content": f"""You are Jarvis, an MNQ futures algo. Give a SHORT market read in 2-3 sentences. Casual, direct, like a trader talking to another trader. Cover: what the price action looks like right now, where you think it's likely to go next (up/down/chop), and why. No fluff, no disclaimers.
+
+Current price: {price}
+Session: {session_name} ({'active' if session_ok else 'sitting out'})
+5hr trend: {long_trend} ({long_move:+.0f}pts)
+2.5hr trend: {mid_trend} ({mid_move:+.0f}pts)
+45min trend: {short_trend} ({short_move:+.0f}pts)
+Range: {recent_low} – {recent_high} ({range_size}pts), price at {range_pos}
+Recent trade bias: {bias or 'neutral'}
+{candle_summary}"""
+                }]
+            )
+            ai_read = "\n\n🧠 <b>Read:</b>\n" + msg.content[0].text
+        except:
+            pass
+
+    if not ai_read:
+        # fallback without AI
+        if long_trend == mid_trend == short_trend:
+            direction = "strongly trending " + long_trend.lower()
+            outlook   = "likely continues " + long_trend.lower()
+        elif long_trend != short_trend:
+            direction = f"bigger trend {long_trend} but short-term {short_trend}"
+            outlook   = "could be a reversal setup forming" if strength > 15 else "chop — no clear edge"
+        else:
+            direction = f"trending {long_trend}"
+            outlook   = "momentum with it"
+        ai_read = f"\n\n💬 <b>Read:</b> {direction.capitalize()}. {outlook.capitalize()}."
+
+    tg_send(
+        f"📊 <b>Jarvis Analysis — {datetime.now().strftime('%H:%M EST')}</b>\n\n"
+        f"Price: <code>{price:,.2f}</code>  |  {session_name}{'✅' if session_ok else '🔴'}\n\n"
+        f"<b>Trends:</b>\n"
+        f"  5hr:   {long_trend} ({long_move:+.0f}pts)\n"
+        f"  2.5hr: {mid_trend} ({mid_move:+.0f}pts)\n"
+        f"  45min: {short_trend} ({short_move:+.0f}pts)\n\n"
+        f"<b>Range:</b> {recent_low} – {recent_high}  ({range_size}pts)\n"
+        f"Price at {range_pos}"
+        f"{bias_str}"
+        f"{ai_read}\n\n"
+        f"<b>Setup status:</b>\n{setup_needed}"
+    )
 
 def send_trade_history():
     """Last 7 days of Jarvis trades."""
