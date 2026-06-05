@@ -360,7 +360,7 @@ def handle_tg_command(text):
                 f"• London or Overnight session ✅\n"
                 f"• Pre-trend DOWN (price dips 15+ pts over 90min)\n"
                 f"• Bigger trend aligned\n"
-                f"• MEDIUM or HIGH conviction score\n\n"
+                f"• Pre-trend drop is real (not just noise)\n\n"
                 f"Right now: {session_name}  |  Pre-trend {pre_trend or '?'}  ({strength:.0f}pts)\n"
                 f"Price: <code>{price:,.2f}</code>"
             )
@@ -518,13 +518,17 @@ def get_trend_strength(candles):
         return 0
     return abs(candles[-6]["c"] - candles[-1]["c"])
 
-# ── Contract Sizing (mirrors Goldmine patterns) ───────────────────
+# ── Contract Sizing (mirrors Goldmine patterns from 66 trades) ────
+# Data: 52% = 5MNQ, 33% = 3MNQ, 8% = 6MNQ, 2% = 7-8MNQ
+# Bigger size when: stronger pre-trend drop, overnight session
 def get_contracts(session_name, candles):
     strength = get_trend_strength(candles)
     if session_name == "Overnight":
-        return 6 if strength >= 30 else 5
+        if strength >= 50: return 6   # strong overnight move
+        return 5                       # standard overnight
     elif session_name == "London":
-        return 5
+        if strength >= 40: return 5   # decent London move
+        return 3                       # weaker London = smaller
     return 3
 
 # ── Adaptive Logic ────────────────────────────────────────────────
@@ -585,43 +589,34 @@ def check_for_signal():
     above_longer = price > long_closes[0]
     side = "BUY" if above_longer else "SELL"
 
-    # Levels
-    entry = round(price, 2)
-    sl  = round(entry - 40, 2) if side == "BUY" else round(entry + 40, 2)
-    tp1 = round(entry + 50, 2) if side == "BUY" else round(entry - 50, 2)
-    tp2 = round(entry + 75, 2) if side == "BUY" else round(entry - 75, 2)
-    tp3 = round(entry + 125, 2) if side == "BUY" else round(entry - 125, 2)
-    contracts = get_contracts(session_name, candles)
-
-    # Adapt size based on recent form
-    wr, streak, reduce = get_jarvis_form()
-    if reduce:
-        contracts = max(1, contracts - 2)  # cut size on bad streak
-
     strength = get_trend_strength(candles)
 
-    # Conviction scoring — based on what actually won in 66 Goldmine trades
-    # Overnight 64% WR, strong pre-trend, clean directional alignment = HIGH
-    score = 0
-    if session_name == "Overnight": score += 3
-    elif session_name == "London":  score += 1
-    if strength >= 40:  score += 3
-    elif strength >= 25: score += 2
-    elif strength >= 15: score += 1
-    # Trend alignment: long trend and short trend pointing same way
-    if len(candles) >= 20:
-        long_trend  = "DOWN" if long_closes[-1] < long_closes[0] else "UP"
-        short_trend = pre_trend
-        if (side == "BUY"  and long_trend == "UP"   and short_trend == "DOWN") or \
-           (side == "SELL" and long_trend == "DOWN" and short_trend == "UP"):
-            score += 2  # perfect setup: pullback against prevailing trend
-    if   score >= 7: conviction = "HIGH"
-    elif score >= 4: conviction = "MEDIUM"
-    else:            conviction = "LOW"
+    # ── Levels — based on actual Goldmine data ─────────────────────
+    # SL: always 40pts (avg 40.5 across 61 trades, nearly universal)
+    # TP1: 50pts (consistent across callouts)
+    # TP2: 75pts (consistent)
+    # TP3: 100pts (actual avg was 101.7pts across 66 trades, NOT 125)
+    entry = round(price, 2)
+    d = 1 if side == "BUY" else -1
+    sl  = round(entry - d * 40,  2)
+    tp1 = round(entry + d * 50,  2)
+    tp2 = round(entry + d * 75,  2)
+    tp3 = round(entry + d * 100, 2)
 
-    # Only auto-enter HIGH or MEDIUM — skip LOW conviction setups
-    if conviction == "LOW":
-        return None, f"LOW conviction ({session_name}, strength {strength:.0f}pts) — skipping"
+    contracts = get_contracts(session_name, candles)
+
+    # Adapt size down on losing streak (3+ losses in a row)
+    wr, streak, reduce = get_jarvis_form()
+    if reduce:
+        contracts = max(3, contracts - 2)
+
+    # ── Trend alignment label (informational only, not a gate) ─────
+    if len(candles) >= 20:
+        long_trend = "DOWN" if long_closes[-1] < long_closes[0] else "UP"
+        aligned = (side == "BUY" and long_trend == "UP") or (side == "SELL" and long_trend == "DOWN")
+    else:
+        long_trend = "?"
+        aligned = True
 
     signal = {
         "side":       side,
@@ -633,46 +628,17 @@ def check_for_signal():
         "contracts":  contracts,
         "session":    session_name,
         "pre_trend":  pre_trend,
-        "conviction": conviction,
         "strength":   round(strength, 1),
+        "aligned":    aligned,
+        "long_trend": long_trend,
         "time":       datetime.now().strftime("%H:%M EST")
     }
     return signal, "SIGNAL"
 
 # ── Build signal Telegram message ─────────────────────────────────
 def format_signal_message(sig):
-    side_emoji = "🟢" if sig["side"] == "BUY" else "🔴"
-    conviction_map = {"HIGH": "🔥 HIGH", "MEDIUM": "⚡ MEDIUM", "LOW": "💧 LOW"}
-    conviction_str = conviction_map.get(sig["conviction"], sig["conviction"])
-
-    session_wr = {"Overnight": 64, "London": 52}.get(sig["session"], 59)
-    risk_usd   = round(40 * PTS_TO_USD * sig["contracts"])
-    tp3_usd    = round(125 * PTS_TO_USD * sig["contracts"])
-
-    # Explain the entry
-    if sig["side"] == "BUY":
-        entry_explanation = (
-            f"Price pulled back {sig['strength']:.0f}pts over the last 90min "
-            f"but the bigger trend is still UP — this is a dip entry, expecting a bounce."
-        )
-    else:
-        entry_explanation = (
-            f"Price pushed up {sig['strength']:.0f}pts over the last 90min "
-            f"but the bigger trend is DOWN — fading the push, expecting a roll."
-        )
-
-    return (
-        f"{side_emoji} <b>JARVIS SIGNAL — {sig['side']} MNQ</b>\n\n"
-        f"<b>Entry:</b>  <code>{sig['entry']}</code>  ({sig['time']})\n"
-        f"<b>SL:</b>     <code>{sig['sl']}</code>  (−{risk_usd}$ risk)\n"
-        f"<b>TP1:</b>    <code>{sig['tp1']}</code>  (+50pts)\n"
-        f"<b>TP2:</b>    <code>{sig['tp2']}</code>  (+75pts)\n"
-        f"<b>TP3:</b>    <code>{sig['tp3']}</code>  (+${tp3_usd})\n\n"
-        f"<b>Session:</b> {sig['session']} ({session_wr}% WR historically)\n"
-        f"<b>Conviction:</b> {conviction_str}  |  <b>Size:</b> {sig['contracts']} MNQ\n\n"
-        f"💡 {entry_explanation}\n\n"
-        f"Reply <b>/take</b> to enter  |  <b>/skip</b> to pass"
-    )
+    # (unused by auto-trader but kept for reference)
+    pass
 
 # ── Auto-resolve open trades ──────────────────────────────────────
 def check_open_jarvis_trades():
@@ -850,11 +816,10 @@ def log_signal(signal, taken=False, skipped=False):
             "tp3":        signal["tp3"],
             "contracts":  signal["contracts"],
             "session":    signal["session"],
-            "conviction": signal["conviction"],
             "strength":   signal["strength"],
             "taken":      taken,
             "skipped":    skipped,
-            "notes":      f"pre_trend:{signal['pre_trend']}"
+            "notes":      f"pre_trend:{signal['pre_trend']} aligned:{signal.get('aligned')}"
         })
     except:
         pass
@@ -873,7 +838,7 @@ def auto_enter_trade(signal):
         "trader":     "JARVIS",
         "source":     "JARVIS",
         "result":     "OPEN",
-        "notes":      f"Session:{signal['session']} Conviction:{signal['conviction']} AUTO"
+        "notes":      f"Session:{signal['session']} Strength:{signal['strength']} Aligned:{signal['aligned']} AUTO"
     }
     logged = sb_insert("trades", trade)
     if not logged:
@@ -883,33 +848,31 @@ def auto_enter_trade(signal):
     risk_usd = round(40  * PTS_TO_USD * signal["contracts"])
     tp1_usd  = round(50  * PTS_TO_USD * c1)
     tp2_usd  = round(75  * PTS_TO_USD * c2)
-    tp3_usd  = round(125 * PTS_TO_USD * c3)
+    tp3_usd  = round(100 * PTS_TO_USD * c3)
     max_usd  = tp1_usd + tp2_usd + tp3_usd
     side_emoji = "🟢" if signal["side"] == "BUY" else "🔴"
-    session_wr = 64 if signal["session"] == "Overnight" else 52 if signal["session"] == "London" else 59
+    session_wr = 64 if signal["session"] == "Overnight" else 52
 
-    # Get form context for the alert
     wr, streak, reduce = get_jarvis_form()
     form_str = ""
-    if streak >= 3:
-        form_str = f"🔥 {streak} trade win streak"
-    elif streak <= -2:
-        form_str = f"⚠️ {abs(streak)} losses in a row — sized down to {signal['contracts']} MNQ"
-    elif wr:
-        form_str = f"📈 {wr}% WR last 10 trades"
+    if streak >= 3:   form_str = f"🔥 {streak} win streak"
+    elif streak <= -2: form_str = f"⚠️ {abs(streak)} losses — sized down"
+    elif wr:           form_str = f"📈 {wr}% WR last 10"
+
+    aligned_str = "✅ trend aligned" if signal.get("aligned") else "⚠️ counter-trend"
 
     tg_send(
         f"{side_emoji} <b>JARVIS ENTERED — #{logged['id']}</b>\n\n"
         f"<b>{signal['side']} {signal['contracts']} MNQ</b> @ <code>{signal['entry']}</code>\n\n"
-        f"SL:  <code>{signal['sl']}</code>  (−${risk_usd})  [{signal['contracts']} MNQ]\n"
+        f"SL:  <code>{signal['sl']}</code>  (−${risk_usd})\n"
         f"TP1: <code>{signal['tp1']}</code>  close {c1} MNQ → +${tp1_usd}\n"
         f"TP2: <code>{signal['tp2']}</code>  close {c2} MNQ → +${tp2_usd}  ← SL to BE\n"
         f"TP3: <code>{signal['tp3']}</code>  close {c3} MNQ → +${tp3_usd}\n"
-        f"Max profit: <b>+${max_usd}</b>\n\n"
-        f"📊 {signal['session']} | {session_wr}% WR hist | {signal['conviction']} conviction\n"
-        f"💡 {'Dip entry — trend UP, bought pullback' if signal['side'] == 'BUY' else 'Fade — trend DOWN, sold push'}\n"
+        f"Max: <b>+${max_usd}</b>\n\n"
+        f"📊 {signal['session']} ({session_wr}% WR)  |  {aligned_str}\n"
+        f"💡 {'Dip entry — bigger trend UP' if signal['side'] == 'BUY' else 'Fade — bigger trend DOWN'}  ({signal['strength']:.0f}pt pullback)\n"
         + (f"{form_str}\n" if form_str else "") +
-        f"\nSend /progress anytime for live update. 🤖"
+        f"\n/progress for live update 🤖"
     )
     return logged["id"]
 
@@ -949,7 +912,7 @@ def check_open_jarvis_trades():
                     f"Trade #{trade['id']}  |  {side} {contracts}MNQ\n"
                     f"TP2 @ <code>{tp2}</code>  ✅\n"
                     f"SL moved to entry <code>{entry}</code> — <b>risk-free now</b>\n"
-                    f"Targeting TP3 @ <code>{tp3}</code>  (+${round(125*PTS_TO_USD*contracts)})"
+                    f"Targeting TP3 @ <code>{tp3}</code>  (+${round(100*PTS_TO_USD*c3)})"
                 )
                 sl = entry  # use updated SL for rest of checks
                 trade["tp2_hit"] = True
