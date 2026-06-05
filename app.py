@@ -520,13 +520,16 @@ def get_15min_candles():
 
 # ── Session Detection ─────────────────────────────────────────────
 def get_session():
-    h = datetime.now().hour
+    h   = datetime.now().hour
+    dow = datetime.now().weekday()  # 0=Mon, 4=Fri
     if 17 <= h or h < 3:
-        return "Overnight", True    # best session
+        return "Overnight", True
     elif 3 <= h < 9:
         return "London", True
     elif 9 <= h < 16:
-        return "NY", True           # enabled — market close setups
+        if dow == 4:                # Friday only — weekly close momentum
+            return "NY", True
+        return "NY", False
     return "Other", False
 
 # ── Pre-trend (last 6 × 15min candles) ───────────────────────────
