@@ -166,6 +166,64 @@ def handle_tg_command(text):
             f"💬 {status_msg}"
         )
 
+    elif cmd in ("/progress", "progress", "prog", "p&l", "pnl", "where", "where at", "update"):
+        open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
+        if not open_trades:
+            tg_send("No open trade right now. Watching for the next setup.")
+            return
+        t = open_trades[0]
+        price     = get_live_price()
+        side      = t["side"]
+        entry     = t["entry"]
+        sl        = t["sl"]
+        tp1       = t["tp1"]
+        tp2       = t["tp2"]
+        tp3       = t["tp3"]
+        contracts = t.get("contracts", 5)
+        tp1_hit   = t.get("tp1_hit", False)
+        tp2_hit   = t.get("tp2_hit", False)
+
+        pts = (price - entry) if side == "BUY" else (entry - price)
+        pnl_usd = round(pts * PTS_TO_USD * contracts, 2)
+
+        # Distance to each level
+        dist_sl  = abs(price - sl)
+        dist_tp1 = abs(price - tp1)
+        dist_tp2 = abs(price - tp2)
+        dist_tp3 = abs(price - tp3)
+
+        # Progress bar: SL → TP3 range
+        total_range = abs(tp3 - sl)
+        progress_pts = pts + 40  # shift so SL=0, entry=40
+        pct = max(0, min(100, round(progress_pts / total_range * 100)))
+        bar_filled = round(pct / 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+
+        # Status
+        if pts > 0:
+            status = "🟢 IN PROFIT"
+        elif pts == 0:
+            status = "⚪ BREAKEVEN"
+        else:
+            status = "🔴 IN DRAWDOWN"
+
+        tp1_str = "✅" if tp1_hit else f"<code>{tp1}</code> ({dist_tp1:.0f}pts away)"
+        tp2_str = "✅ (SL @ BE)" if tp2_hit else f"<code>{tp2}</code> ({dist_tp2:.0f}pts away)"
+        tp3_str = f"<code>{tp3}</code> ({dist_tp3:.0f}pts away)"
+
+        tg_send(
+            f"📊 <b>Trade #{t['id']} — {status}</b>\n\n"
+            f"{side} {contracts}MNQ  |  Entry: <code>{entry}</code>\n"
+            f"Live price: <code>{price:,.2f}</code>\n\n"
+            f"[{bar}] {pct}%\n"
+            f"SL {'(BE)' if tp2_hit else ''} ←————————→ TP3\n\n"
+            f"P&L: <b>{'+'if pts>=0 else ''}{round(pts)}pts  |  ${pnl_usd:+,.2f}</b>\n\n"
+            f"TP1: {tp1_str}\n"
+            f"TP2: {tp2_str}\n"
+            f"TP3: {tp3_str}\n"
+            f"SL:  <code>{sl}</code> ({dist_sl:.0f}pts away)"
+        )
+
     elif cmd in ("/help", "help", "?"):
         tg_send(
             "<b>Jarvis Commands</b>\n\n"
@@ -371,6 +429,34 @@ def get_contracts(session_name, candles):
         return 5
     return 3
 
+# ── Adaptive Logic ────────────────────────────────────────────────
+def get_jarvis_form():
+    """
+    Look at last 10 Jarvis trades to assess current form.
+    Returns: (win_rate, streak, should_reduce_size)
+    """
+    trades = sb_select("trades", extra="&order=id.desc&limit=10")
+    jarvis = [t for t in trades if t.get("source") == "JARVIS" and t.get("result") in ("WIN","LOSS")]
+    if len(jarvis) < 3:
+        return None, 0, False
+
+    wins   = sum(1 for t in jarvis if t["result"] == "WIN")
+    wr     = round(wins / len(jarvis) * 100)
+
+    # Current streak
+    streak = 0
+    last_result = jarvis[0]["result"]
+    for t in jarvis:
+        if t["result"] == last_result:
+            streak += 1
+        else:
+            break
+    streak = streak if last_result == "WIN" else -streak
+
+    # Reduce size if on 3+ loss streak or WR < 30% over last 10
+    reduce = streak <= -3 or wr < 30
+    return wr, streak, reduce
+
 # ── Signal Engine ─────────────────────────────────────────────────
 def check_for_signal():
     # Rule 1: No open Jarvis trades
@@ -408,6 +494,11 @@ def check_for_signal():
     tp2 = round(entry + 75, 2) if side == "BUY" else round(entry - 75, 2)
     tp3 = round(entry + 125, 2) if side == "BUY" else round(entry - 125, 2)
     contracts = get_contracts(session_name, candles)
+
+    # Adapt size based on recent form
+    wr, streak, reduce = get_jarvis_form()
+    if reduce:
+        contracts = max(1, contracts - 2)  # cut size on bad streak
 
     strength = get_trend_strength(candles)
     if session_name == "Overnight" and strength >= 30:
@@ -654,8 +745,148 @@ def log_signal(signal, taken=False, skipped=False):
     except:
         pass
 
+def auto_enter_trade(signal):
+    """Auto-log trade to Supabase and alert Telegram — no manual /take needed."""
+    trade = {
+        "trade_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "side":       signal["side"],
+        "entry":      signal["entry"],
+        "sl":         signal["sl"],
+        "tp1":        signal["tp1"],
+        "tp2":        signal["tp2"],
+        "tp3":        signal["tp3"],
+        "contracts":  signal["contracts"],
+        "trader":     "JARVIS",
+        "source":     "JARVIS",
+        "result":     "OPEN",
+        "notes":      f"Session:{signal['session']} Conviction:{signal['conviction']} AUTO"
+    }
+    logged = sb_insert("trades", trade)
+    if not logged:
+        return
+
+    risk_usd = round(40 * PTS_TO_USD * signal["contracts"])
+    tp3_usd  = round(125 * PTS_TO_USD * signal["contracts"])
+    side_emoji = "🟢" if signal["side"] == "BUY" else "🔴"
+    session_wr = 64 if signal["session"] == "Overnight" else 52 if signal["session"] == "London" else 59
+
+    # Get form context for the alert
+    wr, streak, reduce = get_jarvis_form()
+    form_str = ""
+    if streak >= 3:
+        form_str = f"🔥 {streak} trade win streak"
+    elif streak <= -2:
+        form_str = f"⚠️ {abs(streak)} losses in a row — sized down to {signal['contracts']} MNQ"
+    elif wr:
+        form_str = f"📈 {wr}% WR last 10 trades"
+
+    tg_send(
+        f"{side_emoji} <b>JARVIS ENTERED — #{logged['id']}</b>\n\n"
+        f"<b>{signal['side']} {signal['contracts']} MNQ</b> @ <code>{signal['entry']}</code>\n\n"
+        f"SL:  <code>{signal['sl']}</code>  (−${risk_usd})\n"
+        f"TP1: <code>{signal['tp1']}</code>  (+${round(50*PTS_TO_USD*signal['contracts'])})\n"
+        f"TP2: <code>{signal['tp2']}</code>  (+${round(75*PTS_TO_USD*signal['contracts'])})  ← SL moves to BE\n"
+        f"TP3: <code>{signal['tp3']}</code>  (+${tp3_usd})\n\n"
+        f"📊 {signal['session']} | {session_wr}% WR hist | {signal['conviction']} conviction\n"
+        f"💡 {'Dip entry — trend UP, bought pullback' if signal['side'] == 'BUY' else 'Fade — trend DOWN, sold push'}\n"
+        + (f"{form_str}\n" if form_str else "") +
+        f"\nSend /progress anytime for live update. 🤖"
+    )
+    return logged["id"]
+
+def check_open_jarvis_trades():
+    """Monitor open trades — resolve TP/SL hits, move SL to BE at TP2."""
+    price = get_live_price()
+    if not price:
+        return
+
+    open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
+    for trade in open_trades:
+        side      = trade.get("side")
+        entry     = trade.get("entry")
+        sl        = trade.get("sl")
+        tp1       = trade.get("tp1")
+        tp2       = trade.get("tp2")
+        tp3       = trade.get("tp3")
+        contracts = trade.get("contracts", 5)
+        tp2_hit   = trade.get("tp2_hit", False)
+
+        if not all([entry, sl]):
+            continue
+
+        # Move SL to breakeven when TP2 is hit (only do this once)
+        if not tp2_hit:
+            tp2_crossed = (side == "BUY" and tp2 and price >= tp2) or \
+                          (side == "SELL" and tp2 and price <= tp2)
+            if tp2_crossed:
+                # Move SL to entry (breakeven), mark TP1+TP2 hit
+                sb_update("trades", trade["id"], {
+                    "sl": entry,
+                    "tp1_hit": True,
+                    "tp2_hit": True
+                })
+                tg_send(
+                    f"⚡ <b>TP2 HIT — SL → Breakeven</b>\n\n"
+                    f"Trade #{trade['id']}  |  {side} {contracts}MNQ\n"
+                    f"TP2 @ <code>{tp2}</code>  ✅\n"
+                    f"SL moved to entry <code>{entry}</code> — <b>risk-free now</b>\n"
+                    f"Targeting TP3 @ <code>{tp3}</code>  (+${round(125*PTS_TO_USD*contracts)})"
+                )
+                sl = entry  # use updated SL for rest of checks
+                trade["tp2_hit"] = True
+
+        # Check for final resolution
+        result = tp1h = tp2h = tp3h = slh = None
+        pts = 0
+
+        if side == "BUY":
+            if tp3 and price >= tp3:
+                result="WIN"; tp1h=tp2h=tp3h=True; pts=tp3-entry
+            elif trade.get("tp2_hit") and price <= sl:
+                result="WIN"; tp1h=True; tp2h=True; tp3h=False; pts=sl-entry  # closed at BE = 0pts but WIN
+            elif tp1 and price >= tp1 and not trade.get("tp1_hit"):
+                sb_update("trades", trade["id"], {"tp1_hit": True})
+                tg_send(f"✅ TP1 hit — Trade #{trade['id']}  |  +{round(tp1-entry)}pts  |  Holding for TP2/TP3")
+            elif price <= sl:
+                result="LOSS"; slh=True; pts=sl-entry
+        else:
+            if tp3 and price <= tp3:
+                result="WIN"; tp1h=tp2h=tp3h=True; pts=entry-tp3
+            elif trade.get("tp2_hit") and price >= sl:
+                result="WIN"; tp1h=True; tp2h=True; tp3h=False; pts=entry-sl
+            elif tp1 and price <= tp1 and not trade.get("tp1_hit"):
+                sb_update("trades", trade["id"], {"tp1_hit": True})
+                tg_send(f"✅ TP1 hit — Trade #{trade['id']}  |  +{round(entry-tp1)}pts  |  Holding for TP2/TP3")
+            elif price >= sl:
+                result="LOSS"; slh=True; pts=entry-sl
+
+        if result:
+            pnl_usd = round(pts * PTS_TO_USD * contracts, 2)
+            sb_update("trades", trade["id"], {
+                "result": result, "tp1_hit": bool(tp1h), "tp2_hit": bool(tp2h),
+                "tp3_hit": bool(tp3h), "sl_hit": bool(slh),
+                "pnl_pts": round(pts, 2), "pnl_usd": pnl_usd,
+                "closed_at": datetime.now().isoformat()
+            })
+            if result == "WIN":
+                tps = " → ".join([x for x, h in [("TP1", tp1h), ("TP2", tp2h), ("TP3", tp3h)] if h])
+                msg = (
+                    f"✅ <b>WIN — #{trade['id']}</b>\n\n"
+                    f"{side} {contracts}MNQ  |  {tps}\n"
+                    f"+{round(pts)}pts  |  <b>+${pnl_usd:,.2f}</b>\n\n"
+                    f"Back to watching. 👀"
+                )
+            else:
+                msg = (
+                    f"❌ <b>LOSS — #{trade['id']}</b>\n\n"
+                    f"{side} {contracts}MNQ  |  SL hit @ <code>{sl}</code>\n"
+                    f"{round(pts)}pts  |  <b>−${abs(pnl_usd):,.2f}</b>\n\n"
+                    f"Part of the game. Back to watching."
+                )
+            tg_send(msg)
+
 def background_monitor():
-    """Every 30s: check open trades + fire signal alerts."""
+    """Every 30s: auto-enter trades when signal fires, monitor open positions."""
     last_signal_price = None
     last_signal_time  = 0
 
@@ -667,13 +898,12 @@ def background_monitor():
             if signal:
                 price = signal["entry"]
                 now   = time.time()
-                price_moved  = last_signal_price is None or abs(price - last_signal_price) > 15
-                time_elapsed = now - last_signal_time > 1800  # min 30min between re-alerts
+                price_moved  = last_signal_price is None or abs(price - last_signal_price) > 20
+                time_elapsed = now - last_signal_time > 3600  # min 1hr between new trades
 
-                if price_moved or time_elapsed:
-                    _pending_signal["signal"] = signal
-                    log_signal(signal)  # memory — log every signal seen
-                    tg_send(format_signal_message(signal))
+                if price_moved and time_elapsed:
+                    log_signal(signal)
+                    auto_enter_trade(signal)
                     last_signal_price = price
                     last_signal_time  = now
 
