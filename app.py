@@ -1305,10 +1305,14 @@ def background_monitor():
             pass
         time.sleep(30)
 
-# ── Startup ───────────────────────────────────────────────────────
-if __name__ == "__main__":
+# ── Startup — runs on import (works with gunicorn AND python app.py) ──
+def _start_threads():
     threading.Thread(target=start_ws,           daemon=True).start()
     threading.Thread(target=background_monitor, daemon=True).start()
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
+
+_start_threads()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)
