@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Jarvis</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #080810;
+    --card: #0e0e1a;
+    --border: #1a1a2e;
+    --green: #00ff88;
+    --red: #ff3b5c;
+    --yellow: #f5a623;
+    --text: #e0e0e0;
+    --muted: #3a3a5c;
+  }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; min-height: 100vh; overflow-x: hidden; }
+
+  /* ── TOP BAR ── */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+  }
+  .logo { font-size: 13px; font-weight: 700; letter-spacing: 4px; color: #fff; }
+  .ws-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 8px; box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
+  .ws-dot.off { background: var(--red); box-shadow: 0 0 8px var(--red); animation: none; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .topbar-right { display: flex; align-items: center; gap: 16px; font-size: 11px; color: var(--muted); }
+
+  /* ── PRICE HERO ── */
+  .price-hero { padding: 20px 20px 0; }
+  .price-main { font-size: 52px; font-weight: 800; letter-spacing: -2px; color: #fff; line-height: 1; transition: color 0.3s; }
+  .price-main.up   { color: var(--green); }
+  .price-main.down { color: var(--red); }
+  .price-meta { display: flex; align-items: center; gap: 12px; margin-top: 6px; font-size: 11px; color: var(--muted); }
+  .price-change { font-weight: 600; }
+  .price-change.pos { color: var(--green); }
+  .price-change.neg { color: var(--red); }
+
+  /* ── CHART ── */
+  .chart-wrap {
+    margin: 16px 20px 0;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px;
+    height: 160px;
+    position: relative;
+  }
+  .chart-wrap canvas { width: 100% !important; height: 100% !important; }
+
+  /* ── BADGES ROW ── */
+  .badges { display: flex; gap: 8px; padding: 16px 20px 0; flex-wrap: wrap; }
+  .badge { padding: 5px 12px; border-radius: 20px; font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
+  .badge-green { background: #001a0e; color: var(--green); border: 1px solid #003320; }
+  .badge-red   { background: #1a000a; color: var(--red);   border: 1px solid #330015; }
+  .badge-yellow{ background: #1a1000; color: var(--yellow); border: 1px solid #332200; }
+  .badge-muted { background: #0e0e1a; color: var(--muted); border: 1px solid var(--border); }
+
+  /* ── MAIN GRID ── */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 16px 20px; }
+  @media(max-width:500px){ .grid { grid-template-columns: 1fr; } }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .card-label { font-size: 9px; letter-spacing: 2px; color: var(--muted); text-transform: uppercase; margin-bottom: 10px; }
+
+  /* ── ACCOUNT CARD ── */
+  .balance { font-size: 26px; font-weight: 700; color: #fff; }
+  .pnl-line { font-size: 12px; margin-top: 4px; }
+
+  /* ── SIGNAL CARD ── */
+  .signal-card { grid-column: 1 / -1; }
+  .signal-waiting { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+  .signal-live { }
+  .signal-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
+  .signal-direction { font-size: 32px; font-weight: 800; }
+  .signal-direction.BUY  { color: var(--green); }
+  .signal-direction.SELL { color: var(--red); }
+  .signal-entry { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .signal-contracts { font-size: 22px; font-weight: 700; color: #fff; }
+
+  .levels-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 6px; }
+  .lvl { background: #080810; border-radius: 8px; padding: 8px; text-align: center; border: 1px solid var(--border); }
+  .lvl-label { font-size: 8px; letter-spacing: 1px; color: var(--muted); margin-bottom: 3px; }
+  .lvl-val { font-size: 13px; font-weight: 700; }
+  .lvl-sl   .lvl-val { color: var(--red); }
+  .lvl-tp1  .lvl-val { color: #f5a623; }
+  .lvl-tp2  .lvl-val { color: #7ed6a8; }
+  .lvl-tp3  .lvl-val { color: var(--green); }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+  .btn { flex:1; padding: 13px; border-radius: 10px; border: none; font-size: 13px; font-weight: 800; letter-spacing: 1px; cursor: pointer; transition: all 0.15s; font-family: inherit; }
+  .btn-take { background: var(--green); color: #000; }
+  .btn-take:hover { background: #00cc6a; }
+  .btn-skip { background: #12121e; color: var(--muted); border: 1px solid var(--border); }
+
+  /* ── OPEN TRADE ── */
+  .open-trade-card { grid-column: 1 / -1; }
+  .trade-live { }
+  .trade-live-top { display: flex; justify-content: space-between; align-items: center; }
+  .trade-side { font-size: 18px; font-weight: 800; }
+  .trade-side.BUY  { color: var(--green); }
+  .trade-side.SELL { color: var(--red); }
+  .trade-pnl { font-size: 22px; font-weight: 800; }
+  .trade-pnl.pos { color: var(--green); }
+  .trade-pnl.neg { color: var(--red); }
+  .trade-levels { font-size: 11px; color: var(--muted); margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap; }
+  .trade-bar { margin-top: 10px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .trade-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
+
+  /* ── PERF CARD ── */
+  .perf-row { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .perf-row:last-child { border: none; }
+  .perf-label { color: var(--muted); }
+  .perf-val { font-weight: 700; }
+
+  /* ── TOAST ── */
+  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); padding: 12px 24px; border-radius: 30px; font-weight: 700; font-size: 12px; letter-spacing: 1px; display: none; z-index: 999; }
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div class="logo">JARVIS</div>
+  <div class="topbar-right">
+    <span><span class="ws-dot" id="ws-dot"></span><span id="ws-label">CONNECTING</span></span>
+    <span id="clock">--:--:--</span>
+  </div>
+</div>
+
+<!-- PRICE -->
+<div class="price-hero">
+  <div class="price-main" id="price-display">--</div>
+  <div class="price-meta">
+    <span>MNQM6</span>
+    <span class="price-change" id="price-change">--</span>
+    <span id="price-age" style="color:#222">--</span>
+  </div>
+</div>
+
+<!-- CHART -->
+<div class="chart-wrap">
+  <canvas id="priceChart"></canvas>
+</div>
+
+<!-- SESSION / TREND BADGES -->
+<div class="badges">
+  <span class="badge badge-muted" id="session-badge">--</span>
+  <span class="badge badge-muted" id="trend-badge">--</span>
+</div>
+
+<!-- MAIN GRID -->
+<div class="grid">
+
+  <!-- ACCOUNT -->
+  <div class="card">
+    <div class="card-label">Account (50k sim)</div>
+    <div class="balance" id="balance">$50,000</div>
+    <div class="pnl-line" id="pnl">--</div>
+  </div>
+
+  <!-- PERFORMANCE -->
+  <div class="card">
+    <div class="card-label">Jarvis Record</div>
+    <div id="perf-area">
+      <div class="perf-row"><span class="perf-label">Win Rate</span><span class="perf-val" id="wr">--%</span></div>
+      <div class="perf-row"><span class="perf-label">Record</span><span class="perf-val" id="record">0W / 0L</span></div>
+      <div class="perf-row"><span class="perf-label">Today</span><span class="perf-val" id="today-pnl">$0</span></div>
+    </div>
+  </div>
+
+  <!-- SIGNAL -->
+  <div class="card signal-card" id="signal-card">
+    <div class="card-label">Signal Engine</div>
+    <div id="signal-area">
+      <div class="signal-waiting" id="status-msg">Scanning...</div>
+    </div>
+  </div>
+
+  <!-- OPEN TRADE -->
+  <div class="card open-trade-card" id="open-trade-card" style="display:none">
+    <div class="card-label">Open Trade</div>
+    <div id="open-trade-area"></div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ── Chart setup ───────────────────────────────────────────────────
+const MAX_POINTS = 120;
+const priceData = { labels: [], datasets: [{ data: [], borderColor: '#00ff88', borderWidth: 1.5, pointRadius: 0, tension: 0.1, fill: { target: 'origin', above: 'rgba(0,255,136,0.04)' } }] };
+const chart = new Chart(document.getElementById('priceChart'), {
+  type: 'line',
+  data: priceData,
+  options: {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: { legend: { display: false }, tooltip: { enabled: false } },
+    scales: {
+      x: { display: false },
+      y: { display: false, grace: '5%' }
+    }
+  }
+});
+
+let lastPrice = null;
+let priceRef = null; // first price of session for change calc
+let currentSignal = null;
+let openTrade = null;
+
+function addPricePoint(price) {
+  const now = new Date().toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  priceData.labels.push(now);
+  priceData.datasets[0].data.push(price);
+  if (priceData.labels.length > MAX_POINTS) {
+    priceData.labels.shift();
+    priceData.datasets[0].data.shift();
+  }
+  // Color the line based on trend
+  const pts = priceData.datasets[0].data;
+  if (pts.length >= 2) {
+    const isUp = pts[pts.length-1] >= pts[0];
+    priceData.datasets[0].borderColor = isUp ? '#00ff88' : '#ff3b5c';
+    priceData.datasets[0].fill = { target: 'origin', above: isUp ? 'rgba(0,255,136,0.04)' : 'rgba(255,59,92,0.04)' };
+  }
+  chart.update('none');
+}
+
+function showToast(msg, color='#00ff88') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = color;
+  t.style.color = color === '#00ff88' ? '#000' : '#fff';
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+
+function fmtUSD(n) {
+  const abs = Math.abs(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (n >= 0 ? '+$' : '-$') + abs;
+}
+
+function updateUI(data) {
+  // Clock
+  document.getElementById('clock').textContent = data.time;
+
+  // WS status
+  const dot = document.getElementById('ws-dot');
+  const lbl = document.getElementById('ws-label');
+  if (data.ws_connected) {
+    dot.className = 'ws-dot';
+    lbl.textContent = 'LIVE';
+  } else {
+    dot.className = 'ws-dot off';
+    lbl.textContent = 'DELAYED';
+  }
+
+  // Price
+  if (data.price) {
+    const price = data.price;
+    const priceEl = document.getElementById('price-display');
+    const formatted = price.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+    priceEl.textContent = formatted;
+
+    if (lastPrice !== null) {
+      if (price > lastPrice) priceEl.className = 'price-main up';
+      else if (price < lastPrice) priceEl.className = 'price-main down';
+    }
+    lastPrice = price;
+
+    if (!priceRef) priceRef = price;
+    const chg = price - priceRef;
+    const chgEl = document.getElementById('price-change');
+    chgEl.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + ' pts';
+    chgEl.className = 'price-change ' + (chg >= 0 ? 'pos' : 'neg');
+
+    const ageEl = document.getElementById('price-age');
+    if (data.price_age !== null && data.price_age < 5) {
+      ageEl.textContent = '';
+    } else if (data.price_age !== null) {
+      ageEl.textContent = data.price_age + 's ago';
+    }
+
+    addPricePoint(price);
+  }
+
+  // Session badge
+  const sb = document.getElementById('session-badge');
+  sb.textContent = data.session || '--';
+  sb.className = 'badge ' + (data.session_ok ? 'badge-green' : 'badge-red');
+
+  // Trend badge
+  const tb = document.getElementById('trend-badge');
+  if (data.pre_trend === 'DOWN') {
+    tb.textContent = '↓ PULLBACK — LOOKING';
+    tb.className = 'badge badge-green';
+  } else if (data.pre_trend === 'UP') {
+    tb.textContent = '↑ TREND UP — WAIT';
+    tb.className = 'badge badge-red';
+  } else {
+    tb.textContent = 'READING MARKET...';
+    tb.className = 'badge badge-muted';
+  }
+
+  // Account
+  const s = data.stats;
+  document.getElementById('balance').textContent = '$' + s.balance.toLocaleString('en-US', {minimumFractionDigits:2});
+  const pnlEl = document.getElementById('pnl');
+  pnlEl.textContent = fmtUSD(s.total_pnl) + ' all-time';
+  pnlEl.className = 'pnl-line ' + (s.total_pnl >= 0 ? '' : 'neg');
+  pnlEl.style.color = s.total_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+
+  // Performance
+  document.getElementById('wr').textContent = s.jarvis_wr + '%';
+  document.getElementById('wr').style.color = s.jarvis_wr >= 50 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('record').textContent = s.jarvis_wins + 'W / ' + s.jarvis_losses + 'L';
+
+  // Signal
+  currentSignal = data.signal;
+  const area = document.getElementById('signal-area');
+  if (data.signal) {
+    const sig = data.signal;
+    area.innerHTML = `<div class="signal-live">
+      <div class="signal-top">
+        <div>
+          <div class="signal-direction ${sig.side}">${sig.side}</div>
+          <div class="signal-entry">${sig.session} · ${sig.time}</div>
+        </div>
+        <div class="signal-contracts">${sig.contracts} MNQ</div>
+      </div>
+      <div class="levels-row">
+        <div class="lvl lvl-sl"><div class="lvl-label">STOP</div><div class="lvl-val">${sig.sl}</div></div>
+        <div class="lvl lvl-tp1"><div class="lvl-label">TP1</div><div class="lvl-val">${sig.tp1}</div></div>
+        <div class="lvl lvl-tp2"><div class="lvl-label">TP2</div><div class="lvl-val">${sig.tp2}</div></div>
+        <div class="lvl lvl-tp3"><div class="lvl-label">TP3</div><div class="lvl-val">${sig.tp3}</div></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-take" onclick="takeSignal()">TAKE IT</button>
+        <button class="btn btn-skip" onclick="skipSignal()">SKIP</button>
+      </div>
+    </div>`;
+  } else {
+    area.innerHTML = `<div class="signal-waiting">${data.status_msg || 'Scanning...'}</div>`;
+  }
+
+  // Open trade
+  const otCard = document.getElementById('open-trade-card');
+  if (s.open_trades && s.open_trades.length > 0) {
+    otCard.style.display = 'block';
+    const t = s.open_trades[0];
+    const liveP = data.price || t.entry;
+    const pts = t.side === 'BUY' ? liveP - t.entry : t.entry - liveP;
+    const usd = pts * 2 * (t.contracts || 5);
+
+    // Progress bar: how far from SL to TP3
+    const range = Math.abs(t.tp3 - t.sl);
+    const progress = t.side === 'BUY'
+      ? Math.max(0, Math.min(100, (liveP - t.sl) / range * 100))
+      : Math.max(0, Math.min(100, (t.sl - liveP) / range * 100));
+    const barColor = usd >= 0 ? 'var(--green)' : 'var(--red)';
+
+    document.getElementById('open-trade-area').innerHTML = `
+      <div class="trade-live">
+        <div class="trade-live-top">
+          <div>
+            <span class="trade-side ${t.side}">${t.side}</span>
+            <span style="color:var(--muted);font-size:12px;"> ${t.contracts}MNQ @ ${t.entry}</span>
+          </div>
+          <div class="trade-pnl ${usd>=0?'pos':'neg'}">${fmtUSD(usd)}</div>
+        </div>
+        <div class="trade-levels">
+          <span style="color:var(--red)">SL ${t.sl}</span>
+          <span style="color:var(--yellow)">TP1 ${t.tp1}</span>
+          <span style="color:#7ed6a8">TP2 ${t.tp2}</span>
+          <span style="color:var(--green)">TP3 ${t.tp3}</span>
+        </div>
+        <div class="trade-bar"><div class="trade-bar-fill" style="width:${progress}%;background:${barColor}"></div></div>
+      </div>`;
+  } else {
+    otCard.style.display = 'none';
+  }
+}
+
+async function takeSignal() {
+  if (!currentSignal) return;
+  const res = await fetch('/api/take_signal', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({signal: currentSignal})
+  });
+  const d = await res.json();
+  if (d.ok) showToast('TRADE ON — watching for TP/SL');
+}
+
+async function skipSignal() {
+  await fetch('/api/skip_signal', {method:'POST'});
+  showToast('Skipped', '#888');
+  currentSignal = null;
+  document.getElementById('signal-area').innerHTML = '<div class="signal-waiting">Skipped — scanning...</div>';
+}
+
+async function poll() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    updateUI(data);
+  } catch(e) {}
+}
+
+poll();
+setInterval(poll, 3000); // update every 3 seconds
+</script>
+</body>
+</html>
