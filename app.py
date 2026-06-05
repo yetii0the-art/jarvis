@@ -224,6 +224,9 @@ def handle_tg_command(text):
             f"SL:  <code>{sl}</code> ({dist_sl:.0f}pts away)"
         )
 
+    elif cmd in ("/recap", "recap", "stats", "how we doing", "performance"):
+        send_daily_recap()
+
     elif cmd in ("/help", "help", "?"):
         tg_send(
             "<b>Jarvis Commands</b>\n\n"
@@ -501,14 +504,29 @@ def check_for_signal():
         contracts = max(1, contracts - 2)  # cut size on bad streak
 
     strength = get_trend_strength(candles)
-    if session_name == "Overnight" and strength >= 30:
-        conviction = "HIGH"
-    elif session_name == "Overnight":
-        conviction = "MEDIUM"
-    elif session_name == "London" and strength >= 20:
-        conviction = "MEDIUM"
-    else:
-        conviction = "LOW"
+
+    # Conviction scoring — based on what actually won in 66 Goldmine trades
+    # Overnight 64% WR, strong pre-trend, clean directional alignment = HIGH
+    score = 0
+    if session_name == "Overnight": score += 3
+    elif session_name == "London":  score += 1
+    if strength >= 40:  score += 3
+    elif strength >= 25: score += 2
+    elif strength >= 15: score += 1
+    # Trend alignment: long trend and short trend pointing same way
+    if len(candles) >= 20:
+        long_trend  = "DOWN" if long_closes[-1] < long_closes[0] else "UP"
+        short_trend = pre_trend
+        if (side == "BUY"  and long_trend == "UP"   and short_trend == "DOWN") or \
+           (side == "SELL" and long_trend == "DOWN" and short_trend == "UP"):
+            score += 2  # perfect setup: pullback against prevailing trend
+    if   score >= 7: conviction = "HIGH"
+    elif score >= 4: conviction = "MEDIUM"
+    else:            conviction = "LOW"
+
+    # Only auto-enter HIGH or MEDIUM — skip LOW conviction setups
+    if conviction == "LOW":
+        return None, f"LOW conviction ({session_name}, strength {strength:.0f}pts) — skipping"
 
     signal = {
         "side":       side,
@@ -885,10 +903,53 @@ def check_open_jarvis_trades():
                 )
             tg_send(msg)
 
+def send_daily_recap():
+    """Send end-of-day performance recap to Telegram."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    all_trades = sb_select("trades", extra=f"&trade_date=gte.{today}&source=eq.JARVIS&order=id.asc")
+    resolved   = [t for t in all_trades if t.get("result") in ("WIN", "LOSS")]
+
+    if not resolved:
+        tg_send(f"📋 <b>Daily Recap — {today}</b>\n\nNo trades taken today. Jarvis was watching but conditions weren't right.")
+        return
+
+    wins   = [t for t in resolved if t["result"] == "WIN"]
+    losses = [t for t in resolved if t["result"] == "LOSS"]
+    total_pnl = sum(t.get("pnl_usd") or 0 for t in resolved)
+    wr    = round(len(wins) / len(resolved) * 100)
+
+    # Build trade list
+    trade_lines = ""
+    for t in resolved:
+        side = t.get("side","?")
+        entry = t.get("entry","?")
+        pnl = t.get("pnl_usd", 0) or 0
+        tps = "TP3" if t.get("tp3_hit") else "TP2" if t.get("tp2_hit") else "TP1" if t.get("tp1_hit") else "SL"
+        emoji = "✅" if t["result"] == "WIN" else "❌"
+        trade_lines += f"{emoji} {side} @ {entry}  →  {tps}  ${pnl:+.0f}\n"
+
+    # All-time stats
+    all_jarvis = sb_select("trades", extra="&source=eq.JARVIS")
+    all_resolved = [t for t in all_jarvis if t.get("result") in ("WIN","LOSS")]
+    all_wins = sum(1 for t in all_resolved if t["result"] == "WIN")
+    all_wr   = round(all_wins / max(len(all_resolved), 1) * 100)
+    all_pnl  = sum(t.get("pnl_usd") or 0 for t in all_jarvis)
+
+    tg_send(
+        f"📋 <b>Daily Recap — {today}</b>\n\n"
+        f"Trades: {len(resolved)}  |  {len(wins)}W / {len(losses)}L  |  {wr}% WR\n"
+        f"Day P&L: <b>${total_pnl:+,.2f}</b>\n\n"
+        f"{trade_lines}\n"
+        f"━━━━━━━━━━\n"
+        f"All-time: {len(all_resolved)} trades  |  {all_wr}% WR  |  ${all_pnl:+,.2f}\n"
+        f"Account: ${STARTING_BALANCE + all_pnl:,.2f}"
+    )
+
 def background_monitor():
     """Every 30s: auto-enter trades when signal fires, monitor open positions."""
     last_signal_price = None
     last_signal_time  = 0
+    last_recap_day    = None
 
     while True:
         try:
@@ -899,13 +960,21 @@ def background_monitor():
                 price = signal["entry"]
                 now   = time.time()
                 price_moved  = last_signal_price is None or abs(price - last_signal_price) > 20
-                time_elapsed = now - last_signal_time > 3600  # min 1hr between new trades
+                time_elapsed = now - last_signal_time > 3600
 
                 if price_moved and time_elapsed:
                     log_signal(signal)
                     auto_enter_trade(signal)
                     last_signal_price = price
                     last_signal_time  = now
+
+            # Daily recap at 4pm ET
+            now_dt = datetime.now()
+            if now_dt.hour == 16 and now_dt.minute < 1:
+                today = now_dt.strftime("%Y-%m-%d")
+                if last_recap_day != today:
+                    send_daily_recap()
+                    last_recap_day = today
 
         except Exception as e:
             pass
