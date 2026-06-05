@@ -126,74 +126,70 @@ def tg_get_updates():
     except:
         return []
 
+# ── Command registry — add entries here, /help auto-updates ──────
+COMMANDS = {
+    "📡 Market": [
+        ("/price",    "Live MNQM6 price + session + pre-trend"),
+        ("/status",   "Full status: balance, record, open trade P&L"),
+    ],
+    "📊 Active Trade": [
+        ("/progress", "Live progress: levels, P&L, distance to TP/SL"),
+        ("/skip",     "Block the next auto-signal"),
+    ],
+    "📋 Performance": [
+        ("/recap",    "AI-written recap: what happened + what I'm learning"),
+        ("/trades",   "Last 7 days trade history"),
+    ],
+    "📥 Training Data": [
+        ("/gm",       "Log a Goldmine callout  e.g. /gm SELL 5 30185 30095 30070 30020 SL:30225"),
+    ],
+}
+
+def help_text():
+    lines = "<b>Jarvis Commands</b>\n\n"
+    for section, cmds in COMMANDS.items():
+        lines += f"{section}\n"
+        for cmd, desc in cmds:
+            lines += f"  {cmd} — {desc}\n"
+        lines += "\n"
+    lines += "💬 Natural language works too — \"entry?\" \"explain\" \"how we doing\" \"where at\" \"results\" \"history\"\n\n"
+    lines += "Signals fire automatically. 🤖"
+    return lines
+
 def handle_tg_command(text):
-    text = text.strip().lower()
-    cmd = text.split()[0] if text else ""
+    original = text.strip()
+    text = original.lower()
+    cmd  = text.split()[0] if text else ""
 
-    if cmd in ("/take", "take", "✅"):
-        sig = _pending_signal["signal"]
-        if not sig:
-            tg_send("No active signal right now. I'll ping you when the next one fires.")
-            return
-        log_signal(sig, taken=True)
-        trade = {
-            "trade_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "side":       sig["side"],
-            "entry":      sig["entry"],
-            "sl":         sig["sl"],
-            "tp1":        sig["tp1"],
-            "tp2":        sig["tp2"],
-            "tp3":        sig["tp3"],
-            "contracts":  sig["contracts"],
-            "trader":     "JARVIS",
-            "source":     "JARVIS",
-            "result":     "OPEN",
-            "notes":      f"Session:{sig['session']} PreTrend:{sig['pre_trend']} Conviction:{sig.get('conviction','')}"
-        }
-        logged = sb_insert("trades", trade)
-        if logged:
-            _pending_signal["signal"] = None
-            pnl_risk = round(40 * PTS_TO_USD * sig["contracts"])
-            pnl_tp3  = round(125 * PTS_TO_USD * sig["contracts"])
-            tg_send(
-                f"✅ <b>TRADE OPEN — #{logged['id']}</b>\n\n"
-                f"<b>{sig['side']} {sig['contracts']} MNQ</b>\n"
-                f"Entry: <code>{sig['entry']}</code>\n"
-                f"SL:    <code>{sig['sl']}</code>  (−${pnl_risk} if hit)\n"
-                f"TP1:   <code>{sig['tp1']}</code>  (+${round(50*PTS_TO_USD*sig['contracts'])})\n"
-                f"TP2:   <code>{sig['tp2']}</code>  (+${round(75*PTS_TO_USD*sig['contracts'])})\n"
-                f"TP3:   <code>{sig['tp3']}</code>  (+${pnl_tp3})\n\n"
-                f"I'm watching it live. Will alert when TP or SL hits."
-            )
-        else:
-            tg_send("⚠️ DB error logging trade. Check Supabase.")
-
-    elif cmd in ("/skip", "skip", "❌", "nah"):
+    # ── /skip ──────────────────────────────────────────────────────
+    if cmd in ("/skip", "skip", "❌", "nah"):
         if _pending_signal["signal"]:
             log_signal(_pending_signal["signal"], skipped=True)
             _pending_signal["signal"] = None
-            tg_send("⏭ Skipped. Logged it. Watching for the next setup.")
+            tg_send("⏭ Skipped. Watching for the next setup.")
         else:
             tg_send("No pending signal to skip.")
 
-    elif cmd in ("/price", "price", "p"):
+    # ── /price ─────────────────────────────────────────────────────
+    elif cmd in ("/price", "price"):
         price = get_live_price()
         session_name, session_ok = get_session()
         candles = get_15min_candles()
         pre_trend = get_pretend(candles)
-        trend_emoji = "📉" if pre_trend == "DOWN" else "📈"
-        session_emoji = "🟢" if session_ok else "🔴"
+        strength  = get_trend_strength(candles)
         age = round(time.time() - _ws_price["updated"], 1) if _ws_price["updated"] else "?"
         tg_send(
             f"<b>MNQM6</b>  <code>{price:,.2f}</code>  ({age}s ago)\n"
-            f"{session_emoji} {session_name}  {trend_emoji} Pre-trend {pre_trend or '?'}"
+            f"{'🟢' if session_ok else '🔴'} {session_name}  "
+            f"{'📉' if pre_trend=='DOWN' else '📈'} Pre-trend {pre_trend or '?'} ({strength:.0f}pts)"
         )
 
+    # ── /status ────────────────────────────────────────────────────
     elif cmd in ("/status", "status", "s"):
         price = get_live_price()
         stats = get_stats()
         session_name, session_ok = get_session()
-        candles = get_15min_candles()
+        candles   = get_15min_candles()
         pre_trend = get_pretend(candles)
         _, status_msg = check_for_signal()
 
@@ -204,146 +200,173 @@ def handle_tg_command(text):
             contracts = t.get("contracts", 5)
             tp1_hit   = t.get("tp1_hit", False)
             tp2_hit   = t.get("tp2_hit", False)
-            sl        = t.get("sl", 0)
             if price and entry:
                 unreal, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
-                c1, c2, _ = get_scale(contracts)
-                locked = (c1*50*PTS_TO_USD if tp1_hit else 0) + (c2*75*PTS_TO_USD if tp2_hit else 0)
-                total  = round(locked + unreal, 2)
-                be_str = " | SL@BE" if tp2_hit else ""
-                open_str = (f"\n📊 Open #{t['id']}: {side} {contracts}MNQ @ {entry}{be_str}\n"
-                            f"   Unrealized: ${unreal:+,.2f}  |  Total: ${total:+,.2f}  ({remaining} MNQ open)")
+                c1, c2, _  = get_scale(contracts)
+                locked     = (c1*50*PTS_TO_USD if tp1_hit else 0) + (c2*75*PTS_TO_USD if tp2_hit else 0)
+                total      = round(locked + unreal, 2)
+                be_str     = "  SL@BE ✅" if tp2_hit else ""
+                open_str   = (f"\n\n📊 <b>Open #{t['id']}</b>: {side} {contracts}MNQ @ {entry}{be_str}\n"
+                              f"   Unrealized: ${unreal:+,.2f}  |  Total P&L: <b>${total:+,.2f}</b>  ({remaining} MNQ left)")
 
         tg_send(
             f"<b>Jarvis Status</b>\n\n"
-            f"💰 Balance: <code>${stats['balance']:,.2f}</code>  ({stats['total_pnl']:+.2f})\n"
-            f"📈 Record: {stats['jarvis_wins']}W / {stats['jarvis_losses']}L  ({stats['jarvis_wr']}% WR)\n"
+            f"💰 Balance: <code>${stats['balance']:,.2f}</code>  ({stats['total_pnl']:+,.2f} all-time)\n"
+            f"📈 Record: {stats['jarvis_wins']}W / {stats['jarvis_losses']}L  ({stats['jarvis_wr']}% WR)"
             f"{open_str}\n\n"
-            f"🕐 {session_name} session  |  Pre-trend: {pre_trend or '?'}\n"
+            f"🕐 {session_name}  |  Pre-trend: {pre_trend or '?'}\n"
             f"📡 Price: {price:,.2f}\n"
             f"💬 {status_msg}"
         )
 
-    elif cmd in ("/progress", "progress", "prog", "p&l", "pnl", "where", "where at", "update"):
+    # ── /progress ──────────────────────────────────────────────────
+    elif any(w in text for w in ["/progress", "progress", "prog", "where at", "update", "p&l", "pnl"]):
         open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
         if not open_trades:
-            tg_send("No open trade right now. Watching for the next setup.")
+            tg_send("No open trade. Watching for next setup.")
             return
-        t = open_trades[0]
+        t         = open_trades[0]
         price     = get_live_price()
-        side      = t["side"]
-        entry     = t["entry"]
-        sl        = t["sl"]
-        tp1       = t["tp1"]
-        tp2       = t["tp2"]
-        tp3       = t["tp3"]
+        side      = t["side"];  entry = t["entry"];  sl = t["sl"]
+        tp1       = t["tp1"];   tp2   = t["tp2"];    tp3 = t["tp3"]
         contracts = t.get("contracts", 5)
         tp1_hit   = t.get("tp1_hit", False)
         tp2_hit   = t.get("tp2_hit", False)
-
-        pts = (price - entry) if side == "BUY" else (entry - price)
-        unreal_usd, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
         c1, c2, c3 = get_scale(contracts)
-        locked_usd = (c1 * 50 * PTS_TO_USD if tp1_hit else 0) + (c2 * 75 * PTS_TO_USD if tp2_hit else 0)
-        total_usd  = round(locked_usd + unreal_usd, 2)
 
-        # Distance to each level
-        dist_sl  = abs(price - sl)
-        dist_tp1 = abs(price - tp1)
-        dist_tp2 = abs(price - tp2)
-        dist_tp3 = abs(price - tp3)
+        pts        = (price - entry) if side == "BUY" else (entry - price)
+        unreal, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
+        locked     = (c1*50*PTS_TO_USD if tp1_hit else 0) + (c2*75*PTS_TO_USD if tp2_hit else 0)
+        total      = round(locked + unreal, 2)
 
-        # Progress bar: SL → TP3 range
-        total_range = abs(tp3 - sl)
-        progress_pts = pts + 40  # shift so SL=0, entry=40
-        pct = max(0, min(100, round(progress_pts / total_range * 100)))
-        bar_filled = round(pct / 10)
-        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        total_range   = abs(tp3 - sl)
+        progress_pts  = pts + 40
+        pct           = max(0, min(100, round(progress_pts / total_range * 100)))
+        bar           = "█" * round(pct/10) + "░" * (10 - round(pct/10))
+        status        = "🟢 IN PROFIT" if pts > 0 else "⚪ BREAKEVEN" if pts == 0 else "🔴 DRAWDOWN"
 
-        # Status
-        if pts > 0:
-            status = "🟢 IN PROFIT"
-        elif pts == 0:
-            status = "⚪ BREAKEVEN"
-        else:
-            status = "🔴 IN DRAWDOWN"
+        tp1_str = "✅ hit" if tp1_hit else f"<code>{tp1}</code> ({abs(price-tp1):.0f}pts)"
+        tp2_str = "✅ hit — SL@BE" if tp2_hit else f"<code>{tp2}</code> ({abs(price-tp2):.0f}pts)"
+        tp3_str = f"<code>{tp3}</code> ({abs(price-tp3):.0f}pts)"
 
-        tp1_str = "✅" if tp1_hit else f"<code>{tp1}</code> ({dist_tp1:.0f}pts away)"
-        tp2_str = "✅ (SL @ BE)" if tp2_hit else f"<code>{tp2}</code> ({dist_tp2:.0f}pts away)"
-        tp3_str = f"<code>{tp3}</code> ({dist_tp3:.0f}pts away)"
-
-        locked_str = f"  (${locked_usd:+.0f} locked)" if locked_usd else ""
         tg_send(
             f"📊 <b>Trade #{t['id']} — {status}</b>\n\n"
-            f"{side} {contracts}MNQ  |  Entry: <code>{entry}</code>\n"
-            f"Price: <code>{price:,.2f}</code>  ({remaining} MNQ remaining)\n\n"
+            f"{side} {contracts}MNQ  |  Entry <code>{entry}</code>\n"
+            f"Price: <code>{price:,.2f}</code>  ({remaining} MNQ still open)\n\n"
             f"[{bar}] {pct}%\n"
-            f"SL {'(BE)' if tp2_hit else ''} ←————————→ TP3\n\n"
-            f"Unrealized: <b>${unreal_usd:+,.2f}</b>{locked_str}\n"
-            f"Total P&L:  <b>${total_usd:+,.2f}</b>\n\n"
-            f"TP1: {tp1_str}\n"
-            f"TP2: {tp2_str}\n"
-            f"TP3: {tp3_str}\n"
-            f"SL:  <code>{sl}</code>  ({dist_sl:.0f}pts away)"
+            f"SL{'(BE)' if tp2_hit else ''} ←——————→ TP3\n\n"
+            f"Unrealized: ${unreal:+,.2f}"
+            + (f"  |  Locked: ${locked:+.0f}" if locked else "") +
+            f"\n<b>Total P&L: ${total:+,.2f}</b>\n\n"
+            f"TP1 [{c1} MNQ]: {tp1_str}\n"
+            f"TP2 [{c2} MNQ]: {tp2_str}\n"
+            f"TP3 [{c3} MNQ]: {tp3_str}\n"
+            f"SL:            <code>{sl}</code>  ({abs(price-sl):.0f}pts away)"
         )
 
-    elif cmd in ("/recap", "recap", "how we doing", "performance", "summary"):
+    # ── /recap ─────────────────────────────────────────────────────
+    elif any(w in text for w in ["/recap", "recap", "how we doing", "performance", "summary"]):
         send_smart_recap()
 
-    elif cmd in ("/trades", "trades", "history", "last week", "trade history", "results"):
+    # ── /trades ────────────────────────────────────────────────────
+    elif any(w in text for w in ["/trades", "trades", "history", "last week", "results", "trade history"]):
         send_trade_history()
 
-    elif cmd in ("/help", "help", "?", "commands"):
-        tg_send(
-            "<b>Jarvis Commands</b>\n\n"
-            "📡 <b>Market</b>\n"
-            "/price   — live MNQM6 price + session\n"
-            "/status  — full status + open trade P&L\n\n"
-            "📊 <b>Active Trade</b>\n"
-            "/progress — live trade progress + levels\n"
-            "/skip    — block the next signal\n\n"
-            "📋 <b>Performance</b>\n"
-            "/recap   — AI summary of performance + what Jarvis is learning\n"
-            "/trades  — last 7 days trade history\n\n"
-            "💬 <b>Natural language works too</b>\n"
-            "\"entry?\" \"explain\" \"how we doing\" \"where at\" \"results\"\n\n"
-            "Signals fire automatically — no /take needed. 🤖"
-        )
+    # ── /gm — log a Goldmine callout to training data ──────────────
+    elif cmd == "/gm":
+        # Format: /gm SELL 5 entry sl tp1 tp2 tp3
+        # or just paste their callout text and we parse it
+        parts = original.split()
+        try:
+            # /gm SELL 5 30185 30095 30070 30020 SL:30225
+            # flexible parse — find side, contracts, numbers
+            side_raw = next((p for p in parts if p.upper() in ("BUY","SELL","LONG","SHORT")), None)
+            if not side_raw:
+                raise ValueError("no side")
+            side = "BUY" if side_raw.upper() in ("BUY","LONG") else "SELL"
+            numbers = [float(p.replace("SL:","").replace("sl:","")) for p in parts if p.replace(".","").replace("SL:","").replace("sl:","").isdigit() or (p.replace(".","").lstrip("-").isdigit())]
+            contracts_raw = next((int(p) for p in parts[1:] if p.isdigit() and int(p) <= 20), 5)
+            # numbers should be entry, tp1, tp2, tp3, sl — or entry, sl, tp1, tp2, tp3
+            # pick 5 largest/smallest depending on side
+            nums = sorted(set(numbers))
+            if side == "SELL":
+                # entry is highest, tps go down, sl is above entry
+                sl_val  = max(nums)
+                tp_vals = sorted([n for n in nums if n < sl_val])
+                entry_v = tp_vals[-1] if len(tp_vals) >= 2 else sl_val - 40
+                tps     = sorted([n for n in tp_vals if n < entry_v])
+            else:
+                sl_val  = min(nums)
+                tp_vals = sorted([n for n in nums if n > sl_val])
+                entry_v = tp_vals[0] if tp_vals else sl_val + 40
+                tps     = sorted([n for n in tp_vals if n > entry_v])
 
-    elif any(w in text for w in ["entry", "entries", "what", "explain", "why", "how", "setup", "levels", "signal"]):
-        sig = _pending_signal["signal"]
-        candles = get_15min_candles()
-        session_name, _ = get_session()
-        pre_trend = get_pretend(candles)
-        strength = get_trend_strength(candles)
-        price = get_live_price()
-        if sig:
+            tp1 = tps[0] if len(tps) > 0 else None
+            tp2 = tps[1] if len(tps) > 1 else None
+            tp3 = tps[2] if len(tps) > 2 else None
+
+            trade = {
+                "trade_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "side": side, "entry": entry_v, "sl": sl_val,
+                "tp1": tp1,   "tp2": tp2,       "tp3": tp3,
+                "contracts": contracts_raw,
+                "trader": "GOLDMINE", "source": "TRAINING",
+                "result": "OPEN",
+                "notes": "Added via /gm Telegram command"
+            }
+            logged = sb_insert("trades", trade)
+            if logged:
+                tg_send(
+                    f"✅ <b>Goldmine trade logged #{logged['id']}</b>\n\n"
+                    f"{side} {contracts_raw}MNQ  |  Entry: {entry_v}\n"
+                    f"SL: {sl_val}  |  TP1: {tp1}  TP2: {tp2}  TP3: {tp3}\n\n"
+                    f"Source: TRAINING  |  Jarvis will resolve it when price hits levels."
+                )
+            else:
+                tg_send("⚠️ DB error. Check the format: /gm SELL 5 30185 30095 30070 30020 SL:30225")
+        except Exception as e:
             tg_send(
-                f"<b>Here's what Jarvis is seeing:</b>\n\n"
-                f"📍 Current price: <code>{price:,.2f}</code>\n"
-                f"📉 Pre-trend: price dropped {strength:.0f}pts over last 90min\n"
-                f"📊 Bigger trend: {'UP (long bias)' if sig['side'] == 'BUY' else 'DOWN (short bias)'}\n\n"
-                f"<b>The setup:</b> {sig['side']} — {'dip into an uptrend' if sig['side'] == 'BUY' else 'push into a downtrend'}\n"
-                f"Entry @ <code>{sig['entry']}</code>  →  Risk 40pts, Target up to 125pts\n"
-                f"R:R = 1:3.1 at TP3\n\n"
-                f"Based on 66 Goldmine trades — {session_name} session historically {64 if session_name == 'Overnight' else 52 if session_name == 'London' else 59}% WR\n\n"
-                f"/take to enter  |  /skip to pass"
+                f"Couldn't parse that. Use:\n"
+                f"<code>/gm SELL 5 30185 30095 30070 30020 30225</code>\n"
+                f"(side, contracts, entry, tp1, tp2, tp3, sl)"
+            )
+
+    # ── /help ──────────────────────────────────────────────────────
+    elif any(w in text for w in ["/help", "help", "?", "commands"]):
+        tg_send(help_text())
+
+    # ── natural language ───────────────────────────────────────────
+    elif any(w in text for w in ["entry", "entries", "explain", "setup", "levels", "signal", "why"]):
+        candles      = get_15min_candles()
+        session_name, _ = get_session()
+        pre_trend    = get_pretend(candles)
+        strength     = get_trend_strength(candles)
+        price        = get_live_price()
+        sig          = _pending_signal["signal"]
+        if sig:
+            c1, c2, c3 = get_scale(sig["contracts"])
+            tg_send(
+                f"<b>Current setup:</b>\n\n"
+                f"Price: <code>{price:,.2f}</code>  |  {session_name}  |  Trend: {pre_trend}\n"
+                f"Pre-trend drop: {strength:.0f}pts over 90min\n\n"
+                f"<b>{sig['side']}</b> — {'buying the dip in an uptrend' if sig['side']=='BUY' else 'fading the push in a downtrend'}\n"
+                f"Entry @ <code>{sig['entry']}</code>  |  R:R = 1:3.1 to TP3\n"
+                f"Scale: {c1}/{c2}/{c3} MNQ at TP1/TP2/TP3\n\n"
+                f"{session_name} historically {64 if session_name=='Overnight' else 52}% WR on this setup"
             )
         else:
             tg_send(
-                f"<b>Current conditions:</b>\n\n"
-                f"📍 Price: <code>{price:,.2f}</code>\n"
-                f"🕐 Session: {session_name}\n"
-                f"📈 Pre-trend: {pre_trend or '?'} ({strength:.0f}pts move)\n\n"
-                f"Waiting for: London/Overnight session + pre-trend DOWN\n"
-                f"Will alert when a setup fires."
+                f"<b>Watching for:</b>\n"
+                f"• London or Overnight session ✅\n"
+                f"• Pre-trend DOWN (price dips 15+ pts over 90min)\n"
+                f"• Bigger trend aligned\n"
+                f"• MEDIUM or HIGH conviction score\n\n"
+                f"Right now: {session_name}  |  Pre-trend {pre_trend or '?'}  ({strength:.0f}pts)\n"
+                f"Price: <code>{price:,.2f}</code>"
             )
 
     else:
-        tg_send(
-            f"Didn't catch that. Try /price, /status, or /help.\n"
-            f"If there's a pending signal, say /take or /skip."
-        )
+        tg_send(f"Didn't catch that.\n{help_text()}")
 
 def telegram_poll_loop():
     """Long-poll Telegram for incoming messages and handle commands."""
@@ -1179,10 +1202,9 @@ def send_progress_chime():
 
 def background_monitor():
     """Every 30s: auto-enter trades when signal fires, monitor open positions."""
-    last_signal_price = None
-    last_signal_time  = 0
-    last_recap_day    = None
-    last_chime_time   = 0
+    last_signal_session = None   # track which session we last traded
+    last_recap_day      = None
+    last_chime_time     = 0
 
     while True:
         try:
@@ -1190,16 +1212,12 @@ def background_monitor():
 
             signal, msg = check_for_signal()
             if signal:
-                price = signal["entry"]
-                now   = time.time()
-                price_moved  = last_signal_price is None or abs(price - last_signal_price) > 20
-                time_elapsed = now - last_signal_time > 3600
-
-                if price_moved and time_elapsed:
+                session_key = signal["session"] + datetime.now().strftime("%Y-%m-%d")
+                # MAX 1 trade per session per day (Overnight = 1, London = 1)
+                if last_signal_session != session_key:
                     log_signal(signal)
                     auto_enter_trade(signal)
-                    last_signal_price = price
-                    last_signal_time  = now
+                    last_signal_session = session_key
 
             # Periodic chime every 20min on open trade
             open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
