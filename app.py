@@ -147,13 +147,13 @@ COMMANDS = {
 }
 
 def help_text():
-    lines = "<b>Jarvis Commands</b>\n\n"
+    lines = "<b>Jarvis Commands v2.1</b>\n\n"
     for section, cmds in COMMANDS.items():
         lines += f"{section}\n"
         for cmd, desc in cmds:
             lines += f"  {cmd} — {desc}\n"
         lines += "\n"
-    lines += "💬 Natural language works too — \"entry?\" \"explain\" \"how we doing\" \"where at\" \"results\" \"history\"\n\n"
+    lines += "💬 Natural language works too — \"analysis\" \"recap\" \"where at\" \"results\"\n\n"
     lines += "Signals fire automatically. 🤖"
     return lines
 
@@ -395,9 +395,9 @@ def telegram_poll_loop():
         print(f"[TG] Baseline error: {e}")
 
     tg_send(
-        "🤖 <b>Jarvis online</b>\n\n"
+        "🤖 <b>Jarvis online v2.1</b>\n\n"
         f"Watching MNQM6 — {datetime.now().strftime('%H:%M EST')}\n"
-        "Commands: /price  /status  /take  /skip  /help"
+        "Type /help for all commands."
     )
     print("[TG] Startup message sent")
 
