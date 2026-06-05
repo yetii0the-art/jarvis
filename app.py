@@ -559,6 +559,29 @@ def get_jarvis_form():
     reduce = streak <= -3 or wr < 30
     return wr, streak, reduce
 
+# ── Directional Bias ──────────────────────────────────────────────
+def get_directional_bias():
+    """
+    Look at last 5 closed Jarvis + recent Goldmine trades.
+    If 4+ same direction → that's the bias.
+    Goldmine ran 13 straight BUYs — once trend is clear, stay with it.
+    Returns: "BUY", "SELL", or None
+    """
+    try:
+        trades = sb_select("trades", extra="&order=id.desc&limit=10")
+        recent = [t for t in trades if t.get("source") in ("JARVIS","TRAINING")
+                  and t.get("result") in ("WIN","LOSS","OPEN")][:5]
+        if len(recent) < 3:
+            return None
+        sides = [t["side"] for t in recent]
+        buys  = sides.count("BUY")
+        sells = sides.count("SELL")
+        if buys >= 4:   return "BUY"
+        if sells >= 4:  return "SELL"
+    except:
+        pass
+    return None
+
 # ── Signal Engine ─────────────────────────────────────────────────
 def check_for_signal():
     # Rule 1: No open Jarvis trades
@@ -571,31 +594,49 @@ def check_for_signal():
     if not session_ok:
         return None, f"NY session — sitting out"
 
-    # Rule 3: Pre-trend pullback (DOWN = dip = BUY setup, Goldmine pattern)
     candles = get_15min_candles()
-    pre_trend = get_pretend(candles)
-    if pre_trend != "DOWN":
-        return None, f"Pre-trend {pre_trend} — waiting for pullback ({session_name})"
-
-    if len(candles) < 3:
+    if len(candles) < 6:
         return None, "Not enough candle data"
 
-    # Rule 4: Determine direction from longer trend (20 candles)
+    pre_trend = get_pretend(candles)
+    strength  = get_trend_strength(candles)
+
     price = get_live_price()
     if not price:
         return None, "No live price"
 
+    # ── Bigger trend direction (20 candles) ───────────────────────
     long_closes = [c["c"] for c in candles[-20:]] if len(candles) >= 20 else [c["c"] for c in candles]
-    above_longer = price > long_closes[0]
-    side = "BUY" if above_longer else "SELL"
+    long_trend  = "DOWN" if long_closes[-1] < long_closes[0] else "UP"
 
-    strength = get_trend_strength(candles)
+    # ── Directional bias from recent trade history ─────────────────
+    bias = get_directional_bias()
+
+    # ── Determine side from pre-trend + bigger trend ───────────────
+    # pre-trend DOWN = dip/pullback → BUY the dip (if bigger trend UP)
+    #                               → SELL continuation (if bigger trend DOWN)
+    # pre-trend UP   = push/bounce  → SELL the push (if bigger trend DOWN)
+    #                               → BUY continuation (if bigger trend UP)
+    if pre_trend == "DOWN":
+        side = "BUY" if long_trend == "UP" else "SELL"
+    elif pre_trend == "UP":
+        side = "SELL" if long_trend == "DOWN" else "BUY"
+    else:
+        return None, "No clear pre-trend"
+
+    # Bias override: if recent 4/5 trades strongly lean one way, trust it
+    if bias and bias != side:
+        # Counter-bias signal — still take it but need stronger pre-trend
+        if strength < 20:
+            return None, f"Pre-trend weak ({strength:.0f}pts) + counter to {bias} bias — skipping"
+
+    # Minimum pre-trend strength — needs to be a real move not noise
+    if strength < 10:
+        return None, f"Pre-trend too weak ({strength:.0f}pts) — noise"
+
+    aligned = (side == "BUY" and long_trend == "UP") or (side == "SELL" and long_trend == "DOWN")
 
     # ── Levels — based on actual Goldmine data ─────────────────────
-    # SL: always 40pts (avg 40.5 across 61 trades, nearly universal)
-    # TP1: 50pts (consistent across callouts)
-    # TP2: 75pts (consistent)
-    # TP3: 100pts (actual avg was 101.7pts across 66 trades, NOT 125)
     entry = round(price, 2)
     d = 1 if side == "BUY" else -1
     sl  = round(entry - d * 40,  2)
@@ -605,18 +646,10 @@ def check_for_signal():
 
     contracts = get_contracts(session_name, candles)
 
-    # Adapt size down on losing streak (3+ losses in a row)
+    # Adapt size down on losing streak
     wr, streak, reduce = get_jarvis_form()
     if reduce:
         contracts = max(3, contracts - 2)
-
-    # ── Trend alignment label (informational only, not a gate) ─────
-    if len(candles) >= 20:
-        long_trend = "DOWN" if long_closes[-1] < long_closes[0] else "UP"
-        aligned = (side == "BUY" and long_trend == "UP") or (side == "SELL" and long_trend == "DOWN")
-    else:
-        long_trend = "?"
-        aligned = True
 
     signal = {
         "side":       side,
@@ -631,6 +664,7 @@ def check_for_signal():
         "strength":   round(strength, 1),
         "aligned":    aligned,
         "long_trend": long_trend,
+        "bias":       bias,
         "time":       datetime.now().strftime("%H:%M EST")
     }
     return signal, "SIGNAL"
@@ -794,6 +828,14 @@ def auto_enter_trade(signal):
 
     aligned_str = "✅ trend aligned" if signal.get("aligned") else "⚠️ counter-trend"
 
+    bias = signal.get("bias")
+    pre  = signal.get("pre_trend", "?")
+    if signal["side"] == "BUY":
+        setup_str = "Dip buy" if pre == "DOWN" else "Continuation buy"
+    else:
+        setup_str = "Fade sell" if pre == "UP" else "Continuation sell"
+    bias_str = f"  |  {'🔄 ' + bias + ' bias' if bias else ''}" if bias else ""
+
     tg_send(
         f"{side_emoji} <b>JARVIS ENTERED — #{logged['id']}</b>\n\n"
         f"<b>{signal['side']} {signal['contracts']} MNQ</b> @ <code>{signal['entry']}</code>\n\n"
@@ -803,7 +845,7 @@ def auto_enter_trade(signal):
         f"TP3: <code>{signal['tp3']}</code>  close {c3} MNQ → +${tp3_usd}\n"
         f"Max: <b>+${max_usd}</b>\n\n"
         f"📊 {signal['session']} ({session_wr}% WR)  |  {aligned_str}\n"
-        f"💡 {'Dip entry — bigger trend UP' if signal['side'] == 'BUY' else 'Fade — bigger trend DOWN'}  ({signal['strength']:.0f}pt pullback)\n"
+        f"💡 {setup_str}  ({signal['strength']:.0f}pt move)  |  Bigger trend {signal.get('long_trend','?')}{bias_str}\n"
         + (f"{form_str}\n" if form_str else "") +
         f"\n/progress for live update 🤖"
     )
