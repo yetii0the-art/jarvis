@@ -30,6 +30,13 @@ SB_REST = f"{SUPABASE_URL}/rest/v1"
 STARTING_BALANCE = 50000
 PTS_TO_USD       = 2.0   # $2/pt per MNQ contract
 
+# ── Prop Firm Eval Tracker ────────────────────────────────────────
+EVAL_START    = 50000
+EVAL_TARGET   = 53000   # +$3k = funded
+EVAL_FLOOR    = 48000   # -$2k = blown
+_eval_checkpoints = []   # list of {"type": "funded"|"blown", "total_pnl": float}
+_eval_alerted     = {"last": None}  # prevent repeat alerts
+
 def get_scale(contracts):
     """
     Scale-out breakdown: [tp1_contracts, tp2_contracts, tp3_contracts]
@@ -210,11 +217,23 @@ def handle_tg_command(text):
                 open_str   = (f"\n\n📊 <b>Open #{t['id']}</b>: {side} {contracts}MNQ @ {entry}{be_str}\n"
                               f"   Unrealized: ${unreal:+,.2f}  |  Total P&L: <b>${total:+,.2f}</b>  ({remaining} MNQ left)")
 
+        ev = get_eval_status()
+        # Eval progress bar
+        eval_pct  = max(0, min(100, round((ev["eval_pnl"] + 2000) / 5000 * 100)))
+        eval_bar  = "█" * round(eval_pct/10) + "░" * (10 - round(eval_pct/10))
+        dd_pct    = round(ev["drawdown_used"] / 2000 * 100) if ev["drawdown_used"] > 0 else 0
+        eval_str  = (
+            f"\n\n🏦 <b>Eval #{ev['eval_num']}</b>  (Funded: {ev['funded']}  Blown: {ev['blown']})\n"
+            f"Balance: <code>${ev['eval_balance']:,.2f}</code>  ({ev['eval_pnl']:+,.2f} this eval)\n"
+            f"[{eval_bar}] {eval_pct}%\n"
+            f"To target: ${ev['to_target']:,.0f}  |  DD buffer: ${ev['to_floor']:,.0f} left  ({dd_pct}% used)"
+        )
+
         tg_send(
             f"<b>Jarvis Status</b>\n\n"
-            f"💰 Balance: <code>${stats['balance']:,.2f}</code>  ({stats['total_pnl']:+,.2f} all-time)\n"
             f"📈 Record: {stats['jarvis_wins']}W / {stats['jarvis_losses']}L  ({stats['jarvis_wr']}% WR)"
-            f"{open_str}\n\n"
+            f"{open_str}"
+            f"{eval_str}\n\n"
             f"🕐 {session_name}  |  Pre-trend: {pre_trend or '?'}\n"
             f"📡 Price: {price:,.2f}\n"
             f"💬 {status_msg}"
@@ -502,12 +521,12 @@ def get_15min_candles():
 # ── Session Detection ─────────────────────────────────────────────
 def get_session():
     h = datetime.now().hour
-    if 9 <= h < 16:
-        return "NY", False          # 59% WR but choppy — skip
-    elif 17 <= h or h < 3:
-        return "Overnight", True    # 64% WR — best
+    if 17 <= h or h < 3:
+        return "Overnight", True    # best session
     elif 3 <= h < 9:
-        return "London", True       # 52% WR — ok
+        return "London", True
+    elif 9 <= h < 16:
+        return "NY", True           # enabled — market close setups
     return "Other", False
 
 # ── Pre-trend (last 6 × 15min candles) ───────────────────────────
@@ -529,11 +548,13 @@ def get_trend_strength(candles):
 def get_contracts(session_name, candles):
     strength = get_trend_strength(candles)
     if session_name == "Overnight":
-        if strength >= 50: return 6   # strong overnight move
-        return 5                       # standard overnight
+        if strength >= 50: return 6
+        return 5
     elif session_name == "London":
-        if strength >= 40: return 5   # decent London move
-        return 3                       # weaker London = smaller
+        if strength >= 40: return 5
+        return 3
+    elif session_name == "NY":
+        return 3                       # NY always small — choppier
     return 3
 
 # ── Adaptive Logic ────────────────────────────────────────────────
@@ -706,6 +727,63 @@ def get_stats():
         "training_wr":   round(len(t_wins) / max(len(resolved_t), 1) * 100),
         "open_trades":   j_open
     }
+
+# ── Eval Account ─────────────────────────────────────────────────
+def get_eval_status():
+    """Compute current eval standing from all-time Jarvis P&L."""
+    all_trades = sb_select("trades", extra="&source=eq.JARVIS")
+    total_pnl  = sum(t.get("pnl_usd") or 0 for t in all_trades if t.get("result") in ("WIN","LOSS"))
+
+    # Offset P&L by checkpoints (each funded/blown event resets the eval)
+    pnl_offset = _eval_checkpoints[-1]["total_pnl"] if _eval_checkpoints else 0
+    eval_pnl   = total_pnl - pnl_offset
+    eval_bal   = EVAL_START + eval_pnl
+
+    funded = sum(1 for c in _eval_checkpoints if c["type"] == "funded")
+    blown  = sum(1 for c in _eval_checkpoints if c["type"] == "blown")
+    eval_num = funded + blown + 1  # which eval we're on
+
+    return {
+        "eval_balance":  round(eval_bal, 2),
+        "eval_pnl":      round(eval_pnl, 2),
+        "total_pnl":     round(total_pnl, 2),
+        "funded":        funded,
+        "blown":         blown,
+        "eval_num":      eval_num,
+        "to_target":     round(EVAL_TARGET - eval_bal, 2),
+        "to_floor":      round(eval_bal - EVAL_FLOOR, 2),
+        "drawdown_used": round(EVAL_START - min(eval_bal, EVAL_START), 2),
+    }
+
+def check_eval_thresholds():
+    """Alert and reset eval when funded or blown."""
+    ev = get_eval_status()
+    bal = ev["eval_balance"]
+    key = f"{ev['eval_num']}_{round(bal)}"
+
+    if _eval_alerted["last"] == key:
+        return  # already alerted this state
+
+    if bal >= EVAL_TARGET:
+        _eval_alerted["last"] = key
+        _eval_checkpoints.append({"type": "funded", "total_pnl": ev["total_pnl"]})
+        ev2 = get_eval_status()
+        tg_send(
+            f"🏆 <b>EVAL FUNDED — #{ev['eval_num']}</b>\n\n"
+            f"Account hit ${EVAL_TARGET:,.0f}  (+$3,000)\n"
+            f"Total funded: {ev2['funded']}  |  Blown: {ev2['blown']}\n\n"
+            f"Starting Eval #{ev2['eval_num']} — fresh $50k, let's go."
+        )
+    elif bal <= EVAL_FLOOR:
+        _eval_alerted["last"] = key
+        _eval_checkpoints.append({"type": "blown", "total_pnl": ev["total_pnl"]})
+        ev2 = get_eval_status()
+        tg_send(
+            f"💀 <b>EVAL BLOWN — #{ev['eval_num']}</b>\n\n"
+            f"Hit max drawdown — account at ${bal:,.2f}\n"
+            f"Total blown: {ev2['blown']}  |  Funded: {ev2['funded']}\n\n"
+            f"Starting Eval #{ev2['eval_num']} — reset. Let's be smarter."
+        )
 
 # ── Flask Routes ──────────────────────────────────────────────────
 @app.route("/")
@@ -1162,7 +1240,15 @@ Jarvis MNQ trading bot stats:
                 max_tokens=300,
                 messages=[{
                     "role": "user",
-                    "content": f"""You are Jarvis, an MNQ futures trading bot. Give a SHORT intelligent recap (3-5 sentences max, casual tone like a smart trading partner). Cover: overall performance vibe, what's working or not, and one insight about what the data is showing. Be direct and honest. No fluff.
+                    "content": f"""You are Jarvis, an MNQ algo. Give a SHORT technical recap in 3-4 sentences. Speak like a blunt trading desk analyst — no generic advice, no filler.
+
+ONLY cover what the DATA actually shows:
+- Which session (London/Overnight/NY) had the wins vs losses
+- Whether BUY or SELL trades performed better
+- Did trades reach TP2/TP3 or all dying at SL (suggests entries too late or wrong direction)
+- One specific pattern you can actually see in the numbers
+
+DO NOT say things like "audit the rules", "this screams bad logic", "time to pause", or generic trading clichés. Just read the data like a quant.
 
 {trade_summary}"""
                 }]
@@ -1276,6 +1362,7 @@ def background_monitor():
     while True:
         try:
             check_open_jarvis_trades()
+            check_eval_thresholds()
 
             signal, msg = check_for_signal()
             if signal:
