@@ -203,7 +203,7 @@ def handle_tg_command(text):
             if price and entry:
                 unreal, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
                 c1, c2, _  = get_scale(contracts)
-                locked     = (c1*50*PTS_TO_USD if tp1_hit else 0) + (c2*75*PTS_TO_USD if tp2_hit else 0)
+                locked     = (c1*(tp1-entry if side=="BUY" else entry-tp1)*PTS_TO_USD if tp1_hit else 0) + (c2*(tp2-entry if side=="BUY" else entry-tp2)*PTS_TO_USD if tp2_hit else 0)
                 total      = round(locked + unreal, 2)
                 be_str     = "  SL@BE ✅" if tp2_hit else ""
                 open_str   = (f"\n\n📊 <b>Open #{t['id']}</b>: {side} {contracts}MNQ @ {entry}{be_str}\n"
@@ -599,9 +599,9 @@ def check_for_signal():
     entry = round(price, 2)
     d = 1 if side == "BUY" else -1
     sl  = round(entry - d * 40,  2)
-    tp1 = round(entry + d * 50,  2)
-    tp2 = round(entry + d * 75,  2)
-    tp3 = round(entry + d * 100, 2)
+    tp1 = round(entry + d * 34,  2)   # avg 33.7pts across 61 Goldmine trades
+    tp2 = round(entry + d * 65,  2)   # avg 65.0pts
+    tp3 = round(entry + d * 100, 2)   # avg 101.7pts
 
     contracts = get_contracts(session_name, candles)
 
@@ -639,73 +639,6 @@ def check_for_signal():
 def format_signal_message(sig):
     # (unused by auto-trader but kept for reference)
     pass
-
-# ── Auto-resolve open trades ──────────────────────────────────────
-def check_open_jarvis_trades():
-    price = get_live_price()
-    if not price:
-        return
-
-    open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
-    for trade in open_trades:
-        side      = trade.get("side")
-        entry     = trade.get("entry")
-        sl        = trade.get("sl")
-        tp1       = trade.get("tp1")
-        tp2       = trade.get("tp2")
-        tp3       = trade.get("tp3")
-        contracts = trade.get("contracts", 5)
-
-        if not all([entry, sl]):
-            continue
-
-        result = tp1h = tp2h = tp3h = slh = None
-        pts = 0
-
-        if side == "BUY":
-            if tp3 and price >= tp3:
-                result="WIN"; tp1h=tp2h=tp3h=True; pts=tp3-entry
-            elif tp2 and price >= tp2:
-                result="WIN"; tp1h=tp2h=True; tp3h=False; pts=tp2-entry
-            elif tp1 and price >= tp1:
-                result="WIN"; tp1h=True; tp2h=tp3h=False; pts=tp1-entry
-            elif price <= sl:
-                result="LOSS"; slh=True; pts=sl-entry
-        else:
-            if tp3 and price <= tp3:
-                result="WIN"; tp1h=tp2h=tp3h=True; pts=entry-tp3
-            elif tp2 and price <= tp2:
-                result="WIN"; tp1h=tp2h=True; tp3h=False; pts=entry-tp2
-            elif tp1 and price <= tp1:
-                result="WIN"; tp1h=True; tp2h=tp3h=False; pts=entry-tp1
-            elif price >= sl:
-                result="LOSS"; slh=True; pts=entry-sl
-
-        if result:
-            pnl_usd = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, contracts,
-                                       bool(tp1h), bool(tp2h), bool(tp3h), bool(slh))
-            sb_update("trades", trade["id"], {
-                "result": result, "tp1_hit": bool(tp1h), "tp2_hit": bool(tp2h),
-                "tp3_hit": bool(tp3h), "sl_hit": bool(slh),
-                "pnl_pts": round(pts, 2), "pnl_usd": pnl_usd,
-                "closed_at": datetime.now().isoformat()
-            })
-            tps_hit = " → ".join([x for x, h in [("TP1", tp1h), ("TP2", tp2h), ("TP3", tp3h)] if h])
-            if result == "WIN":
-                msg = (
-                    f"✅ <b>WIN — Jarvis #{trade['id']}</b>\n\n"
-                    f"{trade['side']} {contracts}MNQ  |  {tps_hit}\n"
-                    f"+{round(pts)}pts  |  <b>+${pnl_usd:,.2f}</b>\n\n"
-                    f"Nice. Watching for the next setup."
-                )
-            else:
-                msg = (
-                    f"❌ <b>LOSS — Jarvis #{trade['id']}</b>\n\n"
-                    f"{trade['side']} {contracts}MNQ  |  SL hit @ {sl}\n"
-                    f"{round(pts)}pts  |  <b>-${abs(pnl_usd):,.2f}</b>\n\n"
-                    f"It happens. Back to watching."
-                )
-            tg_send(msg)
 
 # ── Stats ─────────────────────────────────────────────────────────
 def get_stats():
@@ -846,8 +779,8 @@ def auto_enter_trade(signal):
 
     c1, c2, c3 = get_scale(signal["contracts"])
     risk_usd = round(40  * PTS_TO_USD * signal["contracts"])
-    tp1_usd  = round(50  * PTS_TO_USD * c1)
-    tp2_usd  = round(75  * PTS_TO_USD * c2)
+    tp1_usd  = round(34  * PTS_TO_USD * c1)
+    tp2_usd  = round(65  * PTS_TO_USD * c2)
     tp3_usd  = round(100 * PTS_TO_USD * c3)
     max_usd  = tp1_usd + tp2_usd + tp3_usd
     side_emoji = "🟢" if signal["side"] == "BUY" else "🔴"
@@ -895,6 +828,8 @@ def check_open_jarvis_trades():
 
         if not all([entry, sl]):
             continue
+
+        c1, c2, c3 = get_scale(contracts)
 
         # Move SL to breakeven when TP2 is hit (only do this once)
         if not tp2_hit:
@@ -1145,7 +1080,7 @@ def send_progress_chime():
 
     pts = (price - entry) if side == "BUY" else (entry - price)
     unreal, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
-    locked = (c1*50*PTS_TO_USD if tp1_hit else 0) + (c2*75*PTS_TO_USD if tp2_hit else 0)
+    locked = (c1*(tp1-entry if side=="BUY" else entry-tp1)*PTS_TO_USD if tp1_hit else 0) + (c2*(tp2-entry if side=="BUY" else entry-tp2)*PTS_TO_USD if tp2_hit else 0)
     total  = round(locked + unreal, 2)
 
     dist_tp2 = round(abs(price - tp2), 1)
