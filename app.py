@@ -7,11 +7,13 @@ import os, json, time, requests, threading
 import yfinance as yf
 import pandas as pd
 import websocket
+import anthropic
 from datetime import datetime, timedelta
 from flask import Flask, render_template, jsonify, request
 
 # ── Config ────────────────────────────────────────────────────────
 POLYGON_KEY    = os.environ["POLYGON_API_KEY"]
+ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 SUPABASE_URL   = os.environ["SUPABASE_URL"]
 SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -29,12 +31,23 @@ STARTING_BALANCE = 50000
 PTS_TO_USD       = 2.0   # $2/pt per MNQ contract
 
 def get_scale(contracts):
-    """Scale-out breakdown: [tp1_contracts, tp2_contracts, tp3_contracts]"""
-    if contracts >= 6: return [2, 2, 2]
-    if contracts == 5: return [2, 2, 1]
-    if contracts == 4: return [2, 1, 1]
-    if contracts == 3: return [1, 1, 1]
-    return [contracts, 0, 0]
+    """
+    Scale-out breakdown: [tp1_contracts, tp2_contracts, tp3_contracts]
+    TP3 is ALWAYS 1 contract. Extra size loads into TP1/TP2.
+    3  → 1/1/1
+    4  → 2/1/1
+    5  → 3/1/1
+    6  → 3/2/1
+    7  → 4/2/1
+    8  → 5/2/1
+    """
+    c = int(contracts)
+    if c <= 3:  return [1, 1, 1]
+    if c == 4:  return [2, 1, 1]
+    if c == 5:  return [3, 1, 1]
+    if c == 6:  return [3, 2, 1]
+    if c == 7:  return [4, 2, 1]
+    return [c - 3, 2, 1]  # 8+ keeps TP2=2, TP3=1
 
 def calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, contracts, tp1_hit, tp2_hit, tp3_hit, sl_hit):
     """Correct P&L with partial closes at each TP."""
@@ -274,18 +287,27 @@ def handle_tg_command(text):
             f"SL:  <code>{sl}</code>  ({dist_sl:.0f}pts away)"
         )
 
-    elif cmd in ("/recap", "recap", "stats", "how we doing", "performance"):
-        send_daily_recap()
+    elif cmd in ("/recap", "recap", "how we doing", "performance", "summary"):
+        send_smart_recap()
 
-    elif cmd in ("/help", "help", "?"):
+    elif cmd in ("/trades", "trades", "history", "last week", "trade history", "results"):
+        send_trade_history()
+
+    elif cmd in ("/help", "help", "?", "commands"):
         tg_send(
             "<b>Jarvis Commands</b>\n\n"
-            "/take  — enter the pending signal\n"
-            "/skip  — pass on the signal\n"
-            "/price — live MNQ price\n"
-            "/status — full system status\n"
-            "/help — this message\n\n"
-            "I'll alert you automatically when a setup fires."
+            "📡 <b>Market</b>\n"
+            "/price   — live MNQM6 price + session\n"
+            "/status  — full status + open trade P&L\n\n"
+            "📊 <b>Active Trade</b>\n"
+            "/progress — live trade progress + levels\n"
+            "/skip    — block the next signal\n\n"
+            "📋 <b>Performance</b>\n"
+            "/recap   — AI summary of performance + what Jarvis is learning\n"
+            "/trades  — last 7 days trade history\n\n"
+            "💬 <b>Natural language works too</b>\n"
+            "\"entry?\" \"explain\" \"how we doing\" \"where at\" \"results\"\n\n"
+            "Signals fire automatically — no /take needed. 🤖"
         )
 
     elif any(w in text for w in ["entry", "entries", "what", "explain", "why", "how", "setup", "levels", "signal"]):
@@ -959,6 +981,120 @@ def check_open_jarvis_trades():
                     f"Part of the game. Back to watching."
                 )
             tg_send(msg)
+
+def send_trade_history():
+    """Last 7 days of Jarvis trades."""
+    cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    trades = sb_select("trades", extra=f"&source=eq.JARVIS&order=id.desc&limit=30")
+    recent = [t for t in trades if t.get("result") in ("WIN","LOSS","OPEN")]
+
+    if not recent:
+        tg_send("No trades in the last 7 days.")
+        return
+
+    lines = ""
+    for t in recent[:15]:
+        side      = t.get("side","?")
+        entry     = t.get("entry","?")
+        result    = t.get("result","?")
+        pnl       = t.get("pnl_usd") or 0
+        contracts = t.get("contracts", 5)
+        session   = (t.get("notes") or "").split("Session:")[-1].split()[0] if "Session:" in (t.get("notes") or "") else "?"
+        tp3h = "→TP3" if t.get("tp3_hit") else ("→TP2" if t.get("tp2_hit") else ("→TP1" if t.get("tp1_hit") else ""))
+        emoji = "✅" if result == "WIN" else "❌" if result == "LOSS" else "🟡"
+        date  = (t.get("trade_date") or "")[:10]
+        lines += f"{emoji} {date}  {side} {contracts}MNQ @ {entry}  {tp3h}  ${pnl:+.0f}\n"
+
+    wins   = sum(1 for t in recent if t.get("result") == "WIN")
+    losses = sum(1 for t in recent if t.get("result") == "LOSS")
+    total_pnl = sum(t.get("pnl_usd") or 0 for t in recent if t.get("result") in ("WIN","LOSS"))
+    wr = round(wins / max(wins+losses, 1) * 100)
+
+    tg_send(
+        f"📅 <b>Recent Trades</b>\n\n"
+        f"{lines}\n"
+        f"━━━━━━━━━━\n"
+        f"{wins}W / {losses}L  |  {wr}% WR  |  ${total_pnl:+,.2f}"
+    )
+
+def send_smart_recap():
+    """AI-generated recap — what happened, what Jarvis is learning."""
+    all_jarvis = sb_select("trades", extra="&source=eq.JARVIS&order=id.desc&limit=20")
+    resolved   = [t for t in all_jarvis if t.get("result") in ("WIN","LOSS")]
+
+    if not resolved:
+        tg_send("No completed trades yet. Jarvis is still watching. First signal will fire when conditions align.")
+        return
+
+    wins   = [t for t in resolved if t["result"] == "WIN"]
+    losses = [t for t in resolved if t["result"] == "LOSS"]
+    total_pnl = sum(t.get("pnl_usd") or 0 for t in resolved)
+    wr    = round(len(wins) / len(resolved) * 100)
+
+    # Sessions breakdown
+    sessions = {}
+    for t in resolved:
+        s = (t.get("notes") or "").split("Session:")[-1].split()[0] if "Session:" in (t.get("notes") or "") else "Unknown"
+        if s not in sessions: sessions[s] = {"W":0,"L":0}
+        sessions[s]["WIN" == t["result"] and "W" or "L"] += 1
+
+    # TP breakdown
+    tp3_wins = sum(1 for t in wins if t.get("tp3_hit"))
+    tp2_wins = sum(1 for t in wins if t.get("tp2_hit") and not t.get("tp3_hit"))
+    tp1_wins = sum(1 for t in wins if t.get("tp1_hit") and not t.get("tp2_hit"))
+
+    # Recent streak
+    streak = 0
+    last = resolved[0]["result"]
+    for t in resolved:
+        if t["result"] == last: streak += 1
+        else: break
+    streak_str = f"{streak} {'win' if last == 'WIN' else 'loss'} streak"
+
+    # Build data summary for Claude
+    trade_summary = f"""
+Jarvis MNQ trading bot stats:
+- Total trades: {len(resolved)} ({len(wins)}W / {len(losses)}L)
+- Win rate: {wr}%
+- Total P&L: ${total_pnl:+,.2f}
+- Current streak: {streak_str}
+- TP breakdown (wins): TP3={tp3_wins}, TP2={tp2_wins}, TP1={tp1_wins}
+- Recent trades (newest first): {[{"side":t["side"],"result":t["result"],"pnl":t.get("pnl_usd",0),"tp3":t.get("tp3_hit"),"session":(t.get("notes") or "").split("Session:")[-1].split()[0] if "Session:" in (t.get("notes") or "") else "?"} for t in resolved[:8]]}
+"""
+
+    # Use Claude to generate intelligent recap
+    smart_text = ""
+    if ANTHROPIC_KEY:
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            msg = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=300,
+                messages=[{
+                    "role": "user",
+                    "content": f"""You are Jarvis, an MNQ futures trading bot. Give a SHORT intelligent recap (3-5 sentences max, casual tone like a smart trading partner). Cover: overall performance vibe, what's working or not, and one insight about what the data is showing. Be direct and honest. No fluff.
+
+{trade_summary}"""
+                }]
+            )
+            smart_text = msg.content[0].text
+        except:
+            pass
+
+    if not smart_text:
+        smart_text = (f"{'Solid run' if wr >= 55 else 'Rough patch' if wr < 40 else 'Holding steady'} — "
+                      f"{wr}% WR over {len(resolved)} trades. "
+                      f"{'TP3 hitting well, letting winners run.' if tp3_wins > len(wins)*0.4 else 'Need more trades riding to TP3.'} "
+                      f"{'On a good streak right now.' if last=='WIN' and streak>=2 else 'Taking some heat lately, sizing is adjusted.' if last=='LOSS' and streak>=2 else ''}")
+
+    tg_send(
+        f"🧠 <b>Jarvis Recap</b>\n\n"
+        f"<b>Numbers:</b>\n"
+        f"{len(resolved)} trades  |  {wr}% WR  |  ${total_pnl:+,.2f}\n"
+        f"TP3: {tp3_wins}  TP2: {tp2_wins}  TP1: {tp1_wins}  ({streak_str})\n\n"
+        f"<b>What I'm seeing:</b>\n"
+        f"{smart_text}"
+    )
 
 def send_daily_recap():
     """Send end-of-day performance recap to Telegram."""
