@@ -1202,9 +1202,9 @@ def send_progress_chime():
 
 def background_monitor():
     """Every 30s: auto-enter trades when signal fires, monitor open positions."""
-    last_signal_session = None   # track which session we last traded
-    last_recap_day      = None
-    last_chime_time     = 0
+    last_entry_price = None   # don't re-enter if price barely moved
+    last_recap_day   = None
+    last_chime_time  = 0
 
     while True:
         try:
@@ -1212,12 +1212,13 @@ def background_monitor():
 
             signal, msg = check_for_signal()
             if signal:
-                session_key = signal["session"] + datetime.now().strftime("%Y-%m-%d")
-                # MAX 1 trade per session per day (Overnight = 1, London = 1)
-                if last_signal_session != session_key:
+                price = signal["entry"]
+                # Only skip if price hasn't moved at least 25pts since last entry
+                # — different price level = genuinely new setup
+                if last_entry_price is None or abs(price - last_entry_price) >= 25:
                     log_signal(signal)
                     auto_enter_trade(signal)
-                    last_signal_session = session_key
+                    last_entry_price = price
 
             # Periodic chime every 20min on open trade
             open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
