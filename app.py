@@ -85,6 +85,11 @@ def reset_eval_checkpoints():
 _eval_checkpoints = load_eval_checkpoints()
 print(f"[EVAL] Loaded {len(_eval_checkpoints)} checkpoints from DB")
 
+# ── Last SL level — prevent re-entry at blown level ───────────────
+_last_sl = {"price": None, "side": None, "time": 0}   # cleared after 2hrs
+# ── Last signal time — hard dedup even if price barely moves ──────
+_last_signal_time = {"t": 0}
+
 # ── Trade Cooldown ────────────────────────────────────────────────
 # Win: 30min  |  Loss: 60min
 # Reads from DB so it survives Railway deploys/restarts.
@@ -236,7 +241,7 @@ COMMANDS = {
 }
 
 def help_text():
-    lines = "<b>Jarvis Commands v2.1</b>\n\n"
+    lines = "<b>Jarvis Commands v3.0</b>\n\n"
     for section, cmds in COMMANDS.items():
         lines += f"{section}\n"
         for cmd, desc in cmds:
@@ -517,8 +522,9 @@ def telegram_poll_loop():
         print(f"[TG] Baseline error: {e}")
 
     tg_send(
-        "🤖 <b>Jarvis online v2.1</b>\n\n"
+        "🤖 <b>Jarvis online v3.0</b>\n\n"
         f"Watching MNQM6 — {datetime.now().strftime('%H:%M EST')}\n"
+        "Sessions: Overnight ✅  London ✅  NY Fridays only ✅\n"
         "Type /help for all commands."
     )
     print("[TG] Startup message sent")
@@ -636,6 +642,37 @@ def get_15min_candles():
         pass
     return _candle_cache["candles"]
 
+# ── Daily + Overnight levels (HTF context) ───────────────────────
+_daily_cache = {"data": None, "updated": 0}
+
+def get_daily_levels():
+    """Fetch prev day's high/low/close + overnight range. Cached 15min."""
+    if time.time() - _daily_cache["updated"] < 900:
+        return _daily_cache["data"]
+    try:
+        df = yf.Ticker("NQ=F").history(interval="1d", period="5d")
+        if len(df) < 2:
+            return None
+        rows = list(df.iterrows())
+        prev = rows[-2][1]  # yesterday
+        today_row = rows[-1][1]
+        # Overnight range: today's low-to-high so far
+        overnight_high = round(float(today_row["High"]), 2)
+        overnight_low  = round(float(today_row["Low"]),  2)
+        levels = {
+            "prev_high":       round(float(prev["High"]),  2),
+            "prev_low":        round(float(prev["Low"]),   2),
+            "prev_close":      round(float(prev["Close"]), 2),
+            "overnight_high":  overnight_high,
+            "overnight_low":   overnight_low,
+            "overnight_range": round(overnight_high - overnight_low, 1),
+        }
+        _daily_cache["data"]    = levels
+        _daily_cache["updated"] = time.time()
+        return levels
+    except:
+        return None
+
 # ── Session Detection ─────────────────────────────────────────────
 def get_session():
     h   = datetime.now().hour
@@ -739,7 +776,12 @@ def check_for_signal():
     # Rule 2: Good session
     session_name, session_ok = get_session()
     if not session_ok:
-        return None, f"NY session — sitting out"
+        # Be descriptive about why
+        dow = datetime.now().weekday()
+        h   = datetime.now().hour
+        if dow <= 3 and 9 <= h < 17:
+            return None, "NY session Mon-Thu — sitting out. London/Overnight only."
+        return None, f"Waiting for next active session"
 
     candles = get_15min_candles()
     if len(candles) < 6:
@@ -752,7 +794,7 @@ def check_for_signal():
     if not price:
         return None, "No live price"
 
-    # ── Bigger trend direction (20 candles) ───────────────────────
+    # ── Bigger trend direction (20 candles ≈ 5hrs) ────────────────
     long_closes = [c["c"] for c in candles[-20:]] if len(candles) >= 20 else [c["c"] for c in candles]
     long_trend  = "DOWN" if long_closes[-1] < long_closes[0] else "UP"
 
@@ -760,10 +802,6 @@ def check_for_signal():
     bias = get_directional_bias()
 
     # ── Determine side from pre-trend + bigger trend ───────────────
-    # pre-trend DOWN = dip/pullback → BUY the dip (if bigger trend UP)
-    #                               → SELL continuation (if bigger trend DOWN)
-    # pre-trend UP   = push/bounce  → SELL the push (if bigger trend DOWN)
-    #                               → BUY continuation (if bigger trend UP)
     if pre_trend == "DOWN":
         side = "BUY" if long_trend == "UP" else "SELL"
     elif pre_trend == "UP":
@@ -771,15 +809,21 @@ def check_for_signal():
     else:
         return None, "No clear pre-trend"
 
-    # Bias override: if recent 4/5 trades strongly lean one way, trust it
+    # Bias override — counter-bias signal needs stronger pre-trend
     if bias and bias != side:
-        # Counter-bias signal — still take it but need stronger pre-trend
         if strength < 20:
             return None, f"Pre-trend weak ({strength:.0f}pts) + counter to {bias} bias — skipping"
 
-    # Minimum pre-trend strength — needs to be a real move not noise
+    # Minimum pre-trend strength — real move, not noise
     if strength < 10:
         return None, f"Pre-trend too weak ({strength:.0f}pts) — noise"
+
+    # ── Rule: Don't re-enter where we just got stopped out ────────
+    # If last SL hit was within 2hrs and new entry is within 30pts of that level → skip
+    if (_last_sl["price"] and _last_sl["side"] == side and
+            time.time() - _last_sl["time"] < 7200 and
+            abs(price - _last_sl["price"]) < 30):
+        return None, f"Within 30pts of last SL @ {_last_sl['price']} — respect the level"
 
     aligned = (side == "BUY" and long_trend == "UP") or (side == "SELL" and long_trend == "DOWN")
 
@@ -787,9 +831,29 @@ def check_for_signal():
     entry = round(price, 2)
     d = 1 if side == "BUY" else -1
     sl  = round(entry - d * 40,  2)
-    tp1 = round(entry + d * 34,  2)   # avg 33.7pts across 61 Goldmine trades
-    tp2 = round(entry + d * 65,  2)   # avg 65.0pts
-    tp3 = round(entry + d * 100, 2)   # avg 101.7pts
+    tp1 = round(entry + d * 34,  2)
+    tp2 = round(entry + d * 65,  2)
+    tp3 = round(entry + d * 100, 2)
+
+    # ── HTF structural context — adjust tp3 if it runs into key level ──
+    levels   = get_daily_levels()
+    htf_note = ""
+    if levels:
+        if side == "BUY":
+            # Is TP3 above prev day's high? That's a strong resistance zone
+            if tp3 > levels["prev_high"] and tp2 <= levels["prev_high"]:
+                htf_note = f"⚠️ TP3 runs above prev high ({levels['prev_high']}) — structural resistance"
+            elif tp1 > levels["overnight_high"]:
+                htf_note = f"⚠️ TP1 above overnight high ({levels['overnight_high']}) — be cautious"
+            elif entry > levels["prev_high"] - 30 and entry < levels["prev_high"]:
+                htf_note = f"⚠️ Entry near prev day high resistance ({levels['prev_high']}) — tighter setup"
+        else:  # SELL
+            if tp3 < levels["prev_low"] and tp2 >= levels["prev_low"]:
+                htf_note = f"⚠️ TP3 runs below prev low ({levels['prev_low']}) — structural support"
+            elif tp1 < levels["overnight_low"]:
+                htf_note = f"⚠️ TP1 below overnight low ({levels['overnight_low']}) — be cautious"
+            elif entry < levels["prev_low"] + 30 and entry > levels["prev_low"]:
+                htf_note = f"⚠️ Entry near prev day low support ({levels['prev_low']}) — tighter setup"
 
     contracts = get_contracts(session_name, candles)
 
@@ -812,6 +876,8 @@ def check_for_signal():
         "aligned":    aligned,
         "long_trend": long_trend,
         "bias":       bias,
+        "htf_note":   htf_note,
+        "levels":     levels,
         "time":       datetime.now().strftime("%H:%M EST")
     }
     return signal, "SIGNAL"
@@ -1056,6 +1122,16 @@ def auto_enter_trade(signal):
 
     ev = get_eval_status()
 
+    # HTF levels for context in entry message
+    levels   = signal.get("levels") or {}
+    htf_note = signal.get("htf_note", "")
+    htf_str  = ""
+    if levels:
+        htf_str = (f"\n<b>HTF:</b>\n"
+                   f"  Prev day: {levels.get('prev_low','?')} – {levels.get('prev_high','?')}\n"
+                   f"  Overnight: {levels.get('overnight_low','?')} – {levels.get('overnight_high','?')}")
+    htf_warn = f"\n{htf_note}" if htf_note else ""
+
     tg_send(
         f"{side_emoji} <b>JARVIS ENTERED — #{logged['id']}</b>\n\n"
         f"<b>{signal['side']} {signal['contracts']} MNQ</b> @ <code>{signal['entry']}</code>\n\n"
@@ -1063,7 +1139,9 @@ def auto_enter_trade(signal):
         f"  5hr:   {lt} ({long_move:+.0f}pts)\n"
         f"  2.5hr: {'DOWN' if mid_move < 0 else 'UP'} ({mid_move:+.0f}pts)\n"
         f"  45min: {'DOWN' if short_move < 0 else 'UP'} ({short_move:+.0f}pts)\n"
-        f"  → {setup_str}{bias_str}\n\n"
+        f"  → {setup_str}{bias_str}"
+        f"{htf_str}"
+        f"{htf_warn}\n\n"
         f"SL:  <code>{signal['sl']}</code>  (−${risk_usd})\n"
         f"TP1: <code>{signal['tp1']}</code>  {c1}MNQ → +${tp1_usd}\n"
         f"TP2: <code>{signal['tp2']}</code>  {c2}MNQ → +${tp2_usd}  ← SL→BE\n"
@@ -1161,6 +1239,10 @@ def check_open_jarvis_trades():
             else:
                 _cooldown["until"]  = time.time() + 3600
                 _cooldown["reason"] = "LOSS — 60min cooldown"
+                # Remember where SL got hit so we don't re-enter there
+                _last_sl["price"] = sl
+                _last_sl["side"]  = side
+                _last_sl["time"]  = time.time()
 
             ev = get_eval_status()
             if result == "WIN":
@@ -1319,6 +1401,32 @@ def send_market_analysis():
     # Bias context
     bias_str = f"\n🔄 <b>Recent bias: {bias}</b> — last 4/5 trades same direction" if bias else ""
 
+    # HTF daily levels
+    levels   = get_daily_levels()
+    htf_str  = ""
+    htf_context = ""
+    if levels:
+        htf_str = (f"\n<b>Key levels:</b>\n"
+                   f"  Prev day: {levels['prev_low']} – {levels['prev_high']}  (close: {levels['prev_close']})\n"
+                   f"  Overnight: {levels['overnight_low']} – {levels['overnight_high']}  ({levels['overnight_range']}pts range)")
+        htf_context = (f"Prev day high/low: {levels['prev_high']}/{levels['prev_low']} (close: {levels['prev_close']})\n"
+                       f"Overnight range: {levels['overnight_low']}-{levels['overnight_high']}\n"
+                       f"Price relative to: {'above prev high' if price > levels['prev_high'] else 'below prev low' if price < levels['prev_low'] else 'inside prev range'}")
+
+    # Recent Jarvis trade history for Claude context
+    recent_trades = sb_select("trades", extra="&source=eq.JARVIS&order=id.desc&limit=8")
+    recent_closed = [t for t in recent_trades if t.get("result") in ("WIN","LOSS")]
+    trade_history_str = ""
+    if recent_closed:
+        buy_wins  = sum(1 for t in recent_closed if t["side"]=="BUY"  and t["result"]=="WIN")
+        buy_loss  = sum(1 for t in recent_closed if t["side"]=="BUY"  and t["result"]=="LOSS")
+        sell_wins = sum(1 for t in recent_closed if t["side"]=="SELL" and t["result"]=="WIN")
+        sell_loss = sum(1 for t in recent_closed if t["side"]=="SELL" and t["result"]=="LOSS")
+        tp3_pct   = round(sum(1 for t in recent_closed if t.get("tp3_hit")) / max(len(recent_closed),1) * 100)
+        trade_history_str = (f"Recent performance: BUY {buy_wins}W/{buy_loss}L  SELL {sell_wins}W/{sell_loss}L\n"
+                             f"TP3 hit rate recent: {tp3_pct}%\n"
+                             f"Last 3 results: {[t['result'] for t in recent_closed[:3]]}")
+
     # Build the AI analysis if we have the key
     ai_read = ""
     if ANTHROPIC_KEY:
@@ -1327,18 +1435,20 @@ def send_market_analysis():
             candle_summary = f"Last 6 closes (15min): {[round(c['c'],1) for c in candles[-6:]]}"
             msg = client.messages.create(
                 model="claude-haiku-4-5",
-                max_tokens=200,
+                max_tokens=250,
                 messages=[{
                     "role": "user",
-                    "content": f"""You are Jarvis, an MNQ futures algo. Give a SHORT market read in 2-3 sentences. Casual, direct, like a trader talking to another trader. Cover: what the price action looks like right now, where you think it's likely to go next (up/down/chop), and why. No fluff, no disclaimers.
+                    "content": f"""You are Jarvis, an MNQ futures algo. Give a SHORT market read in 2-3 sentences. Casual, direct, like a trader talking to another trader. Cover: what the price action looks like right now relative to key levels, where you think it's likely to go next (up/down/chop), and why. Reference actual numbers. No fluff, no disclaimers.
 
 Current price: {price}
 Session: {session_name} ({'active' if session_ok else 'sitting out'})
 5hr trend: {long_trend} ({long_move:+.0f}pts)
 2.5hr trend: {mid_trend} ({mid_move:+.0f}pts)
 45min trend: {short_trend} ({short_move:+.0f}pts)
-Range: {recent_low} – {recent_high} ({range_size}pts), price at {range_pos}
+Range (20 candles): {recent_low} – {recent_high} ({range_size}pts), price at {range_pos}
+{htf_context}
 Recent trade bias: {bias or 'neutral'}
+{trade_history_str}
 {candle_summary}"""
                 }]
             )
@@ -1366,8 +1476,9 @@ Recent trade bias: {bias or 'neutral'}
         f"  5hr:   {long_trend} ({long_move:+.0f}pts)\n"
         f"  2.5hr: {mid_trend} ({mid_move:+.0f}pts)\n"
         f"  45min: {short_trend} ({short_move:+.0f}pts)\n\n"
-        f"<b>Range:</b> {recent_low} – {recent_high}  ({range_size}pts)\n"
+        f"<b>Range (20c):</b> {recent_low} – {recent_high}  ({range_size}pts)\n"
         f"Price at {range_pos}"
+        f"{htf_str}"
         f"{bias_str}"
         f"{ai_read}\n\n"
         f"<b>Setup status:</b>\n{setup_needed}"
@@ -1661,6 +1772,14 @@ def send_smart_recap():
         else: break
     streak_str = f"{streak} {'win' if last == 'WIN' else 'loss'} streak"
 
+    # Directional breakdown
+    buy_trades  = [t for t in resolved if t["side"] == "BUY"]
+    sell_trades = [t for t in resolved if t["side"] == "SELL"]
+    buy_wr  = round(sum(1 for t in buy_trades  if t["result"]=="WIN") / max(len(buy_trades),1)  * 100)
+    sell_wr = round(sum(1 for t in sell_trades if t["result"]=="WIN") / max(len(sell_trades),1) * 100)
+    buy_pnl  = sum(t.get("pnl_usd") or 0 for t in buy_trades)
+    sell_pnl = sum(t.get("pnl_usd") or 0 for t in sell_trades)
+
     # Build data summary for Claude
     trade_summary = f"""
 Jarvis MNQ trading bot stats:
@@ -1668,8 +1787,11 @@ Jarvis MNQ trading bot stats:
 - Win rate: {wr}%
 - Total P&L: ${total_pnl:+,.2f}
 - Current streak: {streak_str}
+- BUY trades:  {len(buy_trades)}  ({buy_wr}% WR)  ${buy_pnl:+.2f}
+- SELL trades: {len(sell_trades)} ({sell_wr}% WR)  ${sell_pnl:+.2f}
 - TP breakdown (wins): TP3={tp3_wins}, TP2={tp2_wins}, TP1={tp1_wins}
-- Recent trades (newest first): {[{"side":t["side"],"result":t["result"],"pnl":t.get("pnl_usd",0),"tp3":t.get("tp3_hit"),"session":(t.get("notes") or "").split("Session:")[-1].split()[0] if "Session:" in (t.get("notes") or "") else "?"} for t in resolved[:8]]}
+- Session breakdown: {dict(sessions)}
+- Recent 8 trades (newest first): {[{"side":t["side"],"result":t["result"],"pnl":t.get("pnl_usd",0),"tp3":t.get("tp3_hit"),"session":(t.get("notes") or "").split("Session:")[-1].split()[0] if "Session:" in (t.get("notes") or "") else "?"} for t in resolved[:8]]}
 """
 
     # Use Claude to generate intelligent recap
@@ -1707,9 +1829,11 @@ DO NOT say things like "audit the rules", "this screams bad logic", "time to pau
 
     tg_send(
         f"🧠 <b>Jarvis Recap</b>\n\n"
-        f"<b>Numbers:</b>\n"
-        f"{len(resolved)} trades  |  {wr}% WR  |  ${total_pnl:+,.2f}\n"
+        f"<b>Overall:</b>  {len(resolved)} trades  |  {wr}% WR  |  ${total_pnl:+,.2f}\n"
         f"TP3: {tp3_wins}  TP2: {tp2_wins}  TP1: {tp1_wins}  ({streak_str})\n\n"
+        f"<b>By direction:</b>\n"
+        f"  BUY  {len(buy_trades)} trades  {buy_wr}% WR  ${buy_pnl:+.2f}\n"
+        f"  SELL {len(sell_trades)} trades  {sell_wr}% WR  ${sell_pnl:+.2f}\n\n"
         f"<b>What I'm seeing:</b>\n"
         f"{smart_text}"
     )
@@ -1797,68 +1921,109 @@ def send_progress_chime():
 
 def background_monitor():
     """Every 30s: auto-enter trades when signal fires, monitor open positions."""
-    last_entry_price = None   # don't re-enter if price barely moved
     last_recap_day   = None
+    last_weekly_day  = None
     last_chime_time  = 0
+    market_close_done = {}   # date → True when 5pm close was handled
 
     while True:
         try:
-            # At market close (5pm ET) — close any open positions at last price
-            now_h = datetime.now().hour
-            now_dow = datetime.now().weekday()
-            if now_h == 17 and now_dow <= 4:  # 5pm Mon-Fri
+            now_dt  = datetime.now()
+            now_h   = now_dt.hour
+            now_dow = now_dt.weekday()
+            today   = now_dt.strftime("%Y-%m-%d")
+
+            # ── Market close at 5pm ET — close any open position ──
+            if now_h == 17 and now_dow <= 4 and not market_close_done.get(today):
+                market_close_done[today] = True
                 open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
                 for t in open_trades:
-                    price = get_live_price() or t.get("entry", 0)
-                    entry = t.get("entry", 0)
-                    side  = t.get("side")
-                    pts   = (price - entry) if side == "BUY" else (entry - price)
-                    pnl   = round(pts * PTS_TO_USD * t.get("contracts", 5), 2)
-                    result = "WIN" if pts > 0 else "LOSS"
+                    price  = get_live_price() or t.get("entry", 0)
+                    entry  = t.get("entry", 0)
+                    side   = t.get("side")
+                    tp1_h  = t.get("tp1_hit", False)
+                    tp2_h  = t.get("tp2_hit", False)
+                    contracts = t.get("contracts", 5)
+                    c1, c2, c3 = get_scale(contracts)
+                    # If SL was moved to BE after TP2, close remaining at entry
+                    if tp2_h:
+                        close_price = t.get("entry", price)  # BE close
+                        remaining   = contracts - c1 - c2
+                        locked_pnl  = calc_scaled_pnl(entry, side, t.get("tp1"), t.get("tp2"),
+                                                       t.get("tp3"), close_price, contracts,
+                                                       True, True, False, True)
+                        pnl    = locked_pnl
+                        result = "WIN"
+                        pts    = 0
+                    else:
+                        pts    = (price - entry) if side == "BUY" else (entry - price)
+                        pnl    = round(pts * PTS_TO_USD * contracts, 2)
+                        result = "WIN" if pts > 0 else "LOSS"
                     sb_update("trades", t["id"], {
-                        "result": result, "pnl_pts": round(pts,2), "pnl_usd": pnl,
-                        "closed_at": datetime.now().isoformat(),
+                        "result": result, "pnl_pts": round(pts, 2), "pnl_usd": pnl,
+                        "sl_hit": True,
+                        "tp1_hit": tp1_h, "tp2_hit": tp2_h,
+                        "closed_at": now_dt.isoformat(),
                         "notes": (t.get("notes","") + " [closed at market close 5pm ET]")
                     })
-                    tg_send(f"🔔 <b>Market close — Trade #{t['id']} closed</b>\n"
-                            f"{side} @ {entry} → {price}  |  ${pnl:+,.2f}\n"
-                            f"CME maintenance break. Back at 6pm ET.")
+                    ev = get_eval_status()
+                    emoji = "✅" if result == "WIN" else "❌"
+                    tg_send(f"🔔 <b>Market close — Trade #{t['id']} {emoji}</b>\n"
+                            f"{side} @ {entry}  |  Closed ${pnl:+,.2f}\n"
+                            f"{'TP2 hit → closed remaining at breakeven ✅' if tp2_h else f'Price: {price}'}\n"
+                            f"CME maintenance break. Back at 6pm ET.\n"
+                            f"🏦 Eval: ${ev['eval_balance']:,.2f}")
                     push_trade_to_sheets(t["id"])
+                    if result == "WIN":
+                        _cooldown["until"]  = time.time() + 1800
+                        _cooldown["reason"] = "WIN — 30min cooldown"
+                    else:
+                        _cooldown["until"]  = time.time() + 3600
+                        _cooldown["reason"] = "LOSS — 60min cooldown"
+                        _last_sl["price"] = entry
+                        _last_sl["side"]  = side
+                        _last_sl["time"]  = time.time()
 
             check_open_jarvis_trades()
             check_eval_thresholds()
 
-            # Block signals when CME is closed
+            # ── Signal engine — only when market is open ───────────
             if not is_market_open():
                 print(f"[SIGNAL] Market closed — skipping")
             else:
                 signal, msg = check_for_signal()
                 if signal:
-                    price = signal["entry"]
                     cd_secs, cd_reason = get_cooldown_remaining()
                     if cd_secs > 0:
                         print(f"[SIGNAL] Cooldown {round(cd_secs/60)}min left ({cd_reason})")
-                    elif last_entry_price is None or abs(price - last_entry_price) >= 25:
-                        log_signal(signal)
+                    # Hard dedup: don't fire same signal within 10 minutes
+                    elif time.time() - _last_signal_time["t"] < 600:
+                        print(f"[SIGNAL] Dedup — last signal was {round((time.time()-_last_signal_time['t'])/60, 1)}min ago")
+                    else:
+                        log_signal(signal, taken=True)
                         auto_enter_trade(signal)
-                        last_entry_price = price
+                        _last_signal_time["t"] = time.time()
+                else:
+                    print(f"[SIGNAL] {msg}")
 
-            # Periodic chime every 20min on open trade
+            # ── Periodic chime every 20min on open trade ───────────
             open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
             if open_trades and time.time() - last_chime_time > 1200:
                 send_progress_chime()
                 last_chime_time = time.time()
 
-            # Daily recap at 4pm ET
-            now_dt = datetime.now()
-            if now_dt.hour == 16 and now_dt.minute < 1:
-                today = now_dt.strftime("%Y-%m-%d")
-                if last_recap_day != today:
-                    send_daily_recap()
-                    last_recap_day = today
+            # ── Daily recap at 4pm ET ──────────────────────────────
+            if now_h == 16 and now_dt.minute < 1 and last_recap_day != today:
+                send_daily_summary()
+                last_recap_day = today
+
+            # ── Weekly recap Friday after 5pm ET ──────────────────
+            if now_dow == 4 and now_h == 17 and now_dt.minute < 2 and last_weekly_day != today:
+                send_weekly_summary()
+                last_weekly_day = today
 
         except Exception as e:
-            pass
+            print(f"[MONITOR] Error: {e}")
         time.sleep(30)
 
 # ── Startup — runs on import (works with gunicorn AND python app.py) ──
