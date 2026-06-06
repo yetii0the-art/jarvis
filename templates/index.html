@@ -321,8 +321,7 @@ function updateUI(data) {
   document.getElementById('wr').style.color = s.jarvis_wr >= 50 ? 'var(--green)' : 'var(--red)';
   document.getElementById('record').textContent = s.jarvis_wins + 'W / ' + s.jarvis_losses + 'L';
 
-  // Signal
-  currentSignal = data.signal;
+  // Signal — read only, Jarvis auto-enters. No manual take/skip.
   const area = document.getElementById('signal-area');
   if (data.signal) {
     const sig = data.signal;
@@ -330,7 +329,7 @@ function updateUI(data) {
       <div class="signal-top">
         <div>
           <div class="signal-direction ${sig.side}">${sig.side}</div>
-          <div class="signal-entry">${sig.session} · ${sig.time}</div>
+          <div class="signal-entry">${sig.session} · ${sig.time} · ${sig.strength}pt move · trend ${sig.long_trend}</div>
         </div>
         <div class="signal-contracts">${sig.contracts} MNQ</div>
       </div>
@@ -340,10 +339,7 @@ function updateUI(data) {
         <div class="lvl lvl-tp2"><div class="lvl-label">TP2</div><div class="lvl-val">${sig.tp2}</div></div>
         <div class="lvl lvl-tp3"><div class="lvl-label">TP3</div><div class="lvl-val">${sig.tp3}</div></div>
       </div>
-      <div class="btn-row">
-        <button class="btn btn-take" onclick="takeSignal()">TAKE IT</button>
-        <button class="btn btn-skip" onclick="skipSignal()">SKIP</button>
-      </div>
+      <div style="font-size:11px;color:var(--green);margin-top:10px;letter-spacing:1px;">⚡ AUTO-ENTERING — Jarvis is on it</div>
     </div>`;
   } else {
     area.innerHTML = `<div class="signal-waiting">${data.status_msg || 'Scanning...'}</div>`;
@@ -387,22 +383,6 @@ function updateUI(data) {
   }
 }
 
-async function takeSignal() {
-  if (!currentSignal) return;
-  const res = await fetch('/api/take_signal', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({signal: currentSignal})
-  });
-  const d = await res.json();
-  if (d.ok) showToast('TRADE ON — watching for TP/SL');
-}
-
-async function skipSignal() {
-  await fetch('/api/skip_signal', {method:'POST'});
-  showToast('Skipped', '#888');
-  currentSignal = null;
-  document.getElementById('signal-area').innerHTML = '<div class="signal-waiting">Skipped — scanning...</div>';
-}
 
 async function poll() {
   try {
