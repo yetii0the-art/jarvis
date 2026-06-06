@@ -220,23 +220,26 @@ def tg_get_updates():
 # ── Command registry — add entries here, /help auto-updates ──────
 COMMANDS = {
     "📡 Market": [
-        ("/price",    "Live MNQM6 price + session + pre-trend"),
-        ("/analysis", "Full market read — what Jarvis sees + what it needs for a setup"),
-        ("/status",   "Full status: eval balance, record, open trade P&L"),
+        ("/price",    "Live MNQM6 price, session, pre-trend direction + strength"),
+        ("/analysis", "Full read: trends, key levels, HTF context, AI outlook + setup status"),
+        ("/status",   "Eval balance, W/L record, open trade P&L, cooldown, session"),
     ],
     "📊 Active Trade": [
-        ("/progress", "Live progress: levels, P&L, eval balance, distance to TP/SL"),
-        ("/skip",     "Block the next auto-signal"),
+        ("/progress", "Live P&L, distance to each TP/SL, locked profit, bar chart"),
+        ("/skip",     "Block the current pending signal (use before it fires)"),
     ],
     "📋 Performance": [
-        ("/recap",    "AI-written recap: technical analysis of what's working"),
-        ("/trades",   "Last 7 days trade history"),
-        ("/daily",    "Today's recap — trades, P&L, eval status + sheet row"),
-        ("/weekly",   "This week's recap — full stats + sheet rows"),
-        ("/sheet",    "Copy-paste spreadsheet block for all recent trades"),
+        ("/recap",    "AI recap — BUY vs SELL breakdown, TP3 rate, what's working"),
+        ("/trades",   "Last 15 trades — date, side, result, P&L"),
+        ("/daily",    "Today's trades + P&L + eval status, auto-pushes to Sheets"),
+        ("/weekly",   "This week's full stats + session breakdown, auto-pushes to Sheets"),
+        ("/sheet",    "Last 10 trades as copy-paste spreadsheet rows"),
     ],
     "📥 Training Data": [
-        ("/gm",       "Log a Goldmine callout  e.g. /gm SELL 5 30185 30095 30070 30020 SL:30225"),
+        ("/gm",       "Log Goldmine callout: /gm SELL 5 entry tp1 tp2 tp3 sl"),
+    ],
+    "⚙️ Admin": [
+        ("/reseteval","Nuclear reset eval checkpoints — only if data is corrupt"),
     ],
 }
 
