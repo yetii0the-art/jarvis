@@ -1065,8 +1065,89 @@ def log_signal(signal, taken=False, skipped=False):
     except:
         pass
 
+def build_entry_bio(signal):
+    """
+    Plain English narrative of WHY Jarvis took this trade.
+    This goes into Supabase notes AND Google Sheets 'Why' column.
+    Written so a human can read it a year later and understand.
+    """
+    side      = signal["side"]
+    contracts = signal["contracts"]
+    session   = signal["session"]
+    pre_trend = signal.get("pre_trend", "?")
+    strength  = signal.get("strength", 0)
+    long_trend= signal.get("long_trend", "?")
+    aligned   = signal.get("aligned", False)
+    bias      = signal.get("bias")
+    entry     = signal["entry"]
+    sl        = signal["sl"]
+    tp3       = signal["tp3"]
+    htf_note  = signal.get("htf_note", "")
+
+    # Setup description
+    if side == "BUY" and pre_trend == "DOWN":
+        setup = f"dip buy — price pulled back {strength:.0f}pts in the last 90min, buying the dip into an uptrend"
+    elif side == "BUY" and pre_trend == "UP":
+        setup = f"trend continuation buy — price climbing {strength:.0f}pts, riding the uptrend"
+    elif side == "SELL" and pre_trend == "UP":
+        setup = f"fade sell — price pushed up {strength:.0f}pts into a downtrend, fading the bounce"
+    elif side == "SELL" and pre_trend == "DOWN":
+        setup = f"trend continuation sell — price falling {strength:.0f}pts, riding the downtrend"
+    else:
+        setup = f"momentum trade — {side} on {strength:.0f}pt pre-trend move"
+
+    align_str = "trend aligned" if aligned else "counter-trend (needed 20pt+ pre-trend to qualify)"
+    bias_str  = f" Last 4-5 trades were {bias}s so directional bias confirmed." if bias == side else (
+                f" Going against recent {bias} bias — needed extra strength to qualify." if bias else "")
+
+    levels  = signal.get("levels") or {}
+    htf_str = ""
+    if levels:
+        htf_str = (f" Prev day range: {levels.get('prev_low','?')}-{levels.get('prev_high','?')}."
+                   f" Overnight: {levels.get('overnight_low','?')}-{levels.get('overnight_high','?')}.")
+
+    warn_str = f" NOTE: {htf_note}." if htf_note else ""
+
+    risk_pts = round(abs(entry - sl))
+    max_pts  = round(abs(tp3 - entry))
+
+    bio = (
+        f"{side} {contracts} MNQ @ {entry} — {setup}. "
+        f"{session} session, 5hr trend {long_trend}, {align_str}.{bias_str}"
+        f" Risk: {risk_pts}pts SL @ {sl}. Max target: {max_pts}pts @ TP3 {tp3}."
+        f"{htf_str}{warn_str}"
+    )
+    return bio
+
+def build_close_bio(trade, result, tp1h, tp2h, tp3h, slh, pnl_usd, pts):
+    """Plain English narrative of how the trade closed."""
+    side  = trade.get("side")
+    entry = trade.get("entry")
+    sl    = trade.get("sl")
+    tp1   = trade.get("tp1")
+    tp2   = trade.get("tp2")
+    tp3   = trade.get("tp3")
+    contracts = trade.get("contracts", 5)
+
+    if tp3h:
+        close_story = f"Hit all 3 targets — ran the full {round(abs(tp3-entry))}pts to TP3 @ {tp3}. Clean trend continuation."
+    elif tp2h and not slh:
+        close_story = f"Hit TP1 + TP2, then reversed before TP3. SL moved to breakeven after TP2, closed there. Partial win."
+    elif tp2h and slh:
+        close_story = f"Hit TP1 + TP2 (SL at breakeven), remaining contract closed at entry. Locked partial profit."
+    elif tp1h:
+        close_story = f"Hit TP1 only, then reversed. Took partial profit but didn't reach TP2."
+    elif slh:
+        stop_pts = round(abs(entry - sl))
+        close_story = f"Stopped out — SL hit @ {sl}, -{stop_pts}pts. Price moved against the setup without reaching TP1."
+    else:
+        close_story = f"Closed — {result}."
+
+    return f"{close_story} P&L: ${pnl_usd:+.2f} ({contracts} MNQ)."
+
 def auto_enter_trade(signal):
     """Auto-log trade to Supabase and alert Telegram — no manual /take needed."""
+    bio = build_entry_bio(signal)
     trade = {
         "trade_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "side":       signal["side"],
@@ -1079,7 +1160,7 @@ def auto_enter_trade(signal):
         "trader":     "JARVIS",
         "source":     "JARVIS",
         "result":     "OPEN",
-        "notes":      f"Session:{signal['session']} Strength:{signal['strength']} Aligned:{signal['aligned']} AUTO"
+        "notes":      bio
     }
     logged = sb_insert("trades", trade)
     if not logged:
@@ -1262,8 +1343,13 @@ def check_open_jarvis_trades():
                     f"🏦 Eval: ${ev['eval_balance']:,.2f}  (${ev['to_floor']:,.0f} DD buffer left)\n"
                     f"Cooling down 60min. Back to watching."
                 )
+            close_bio = build_close_bio(trade, result, tp1h, tp2h, tp3h, slh, pnl_usd, pts)
+            # Append close bio to the trade notes in DB
+            existing_notes = trade.get("notes") or ""
+            sb_update("trades", trade["id"], {"notes": existing_notes + "  ||  " + close_bio})
+
             tg_send(msg)
-            push_trade_to_sheets(trade["id"])
+            push_trade_to_sheets(trade["id"], close_bio=close_bio)
             threading.Thread(target=send_post_trade_analysis,
                              args=(trade, result, pnl_usd, tp1h, tp2h, tp3h, slh, pts),
                              daemon=True).start()
@@ -1501,8 +1587,8 @@ def sheets_post(payload):
     except Exception as e:
         print(f"[SHEETS] Error: {e}")
 
-def push_trade_to_sheets(trade_id):
-    """Push a completed trade to Google Sheets."""
+def push_trade_to_sheets(trade_id, close_bio=""):
+    """Push a completed trade to Google Sheets with full human-readable bio."""
     if not GOOGLE_SHEETS_URL:
         return
     try:
@@ -1515,9 +1601,24 @@ def push_trade_to_sheets(trade_id):
                   "TP2" if t.get("tp2_hit") else
                   "TP1" if t.get("tp1_hit") else
                   "SL"  if t.get("sl_hit")  else "OPEN")
-        notes   = t.get("notes","")
-        session = notes.split("Session:")[-1].split()[0] if "Session:" in notes else ""
-        why_str = notes.split("Strength:")[-1][:40] if "Strength:" in notes else notes[:40]
+
+        # The notes field IS the entry bio now (plain English)
+        entry_bio = t.get("notes") or ""
+        # Strip old-format notes that have colons (legacy trades)
+        if "Session:" in entry_bio or "AUTO-CANCELED" in entry_bio or "restored" in entry_bio:
+            entry_bio = f"{t.get('side')} {t.get('contracts')} MNQ @ {t.get('entry')} — legacy trade"
+
+        # Infer session from bio or notes
+        session = "Overnight"
+        for s in ["London", "NY", "Overnight"]:
+            if s.lower() in entry_bio.lower():
+                session = s
+                break
+
+        # Full story = entry bio + close bio
+        full_story = entry_bio
+        if close_bio:
+            full_story = entry_bio + "  |  CLOSE: " + close_bio
 
         sheets_post({
             "action":       "log_trade",
@@ -1540,7 +1641,7 @@ def push_trade_to_sheets(trade_id):
             "dd_left":      ev["to_floor"],
             "eval_num":     ev["eval_num"],
             "session":      session,
-            "why":          why_str,
+            "why":          full_story,
         })
     except Exception as e:
         print(f"[SHEETS] push_trade error: {e}")
@@ -1973,7 +2074,8 @@ def background_monitor():
                             f"{'TP2 hit → closed remaining at breakeven ✅' if tp2_h else f'Price: {price}'}\n"
                             f"CME maintenance break. Back at 6pm ET.\n"
                             f"🏦 Eval: ${ev['eval_balance']:,.2f}")
-                    push_trade_to_sheets(t["id"])
+                    mkt_close_bio = build_close_bio(t, result, tp1_h, tp2_h, False, True, pnl, pts)
+                    push_trade_to_sheets(t["id"], close_bio=mkt_close_bio)
                     if result == "WIN":
                         _cooldown["until"]  = time.time() + 1800
                         _cooldown["reason"] = "WIN — 30min cooldown"
