@@ -11,8 +11,18 @@ import anthropic
 from datetime import datetime, timedelta
 from flask import Flask, render_template, jsonify, request
 
+# optional Google Sheets
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials as GCredentials
+    GSPREAD_OK = True
+except ImportError:
+    GSPREAD_OK = False
+
 # ── Config ────────────────────────────────────────────────────────
 POLYGON_KEY    = os.environ["POLYGON_API_KEY"]
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+GOOGLE_CREDS    = os.environ.get("GOOGLE_CREDS_JSON", "")  # service account JSON as string
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 SUPABASE_URL   = os.environ["SUPABASE_URL"]
 SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
@@ -36,6 +46,12 @@ EVAL_TARGET   = 53000   # +$3k = funded
 EVAL_FLOOR    = 48000   # -$2k = blown
 _eval_checkpoints = []   # list of {"type": "funded"|"blown", "total_pnl": float}
 _eval_alerted     = {"last": None}  # prevent repeat alerts
+
+# ── Trade Cooldown ────────────────────────────────────────────────
+# After a trade closes, wait before next entry.
+# Win: 30min cooldown  |  Loss: 60min cooldown
+# Mirrors Goldmine's 1-2 trades/day pace, prevents spam entries.
+_cooldown = {"until": 0, "reason": ""}
 
 def get_scale(contracts):
     """
@@ -138,15 +154,18 @@ COMMANDS = {
     "📡 Market": [
         ("/price",    "Live MNQM6 price + session + pre-trend"),
         ("/analysis", "Full market read — what Jarvis sees + what it needs for a setup"),
-        ("/status",   "Full status: balance, record, open trade P&L"),
+        ("/status",   "Full status: eval balance, record, open trade P&L"),
     ],
     "📊 Active Trade": [
-        ("/progress", "Live progress: levels, P&L, distance to TP/SL"),
+        ("/progress", "Live progress: levels, P&L, eval balance, distance to TP/SL"),
         ("/skip",     "Block the next auto-signal"),
     ],
     "📋 Performance": [
-        ("/recap",    "AI-written recap: what happened + what I'm learning"),
+        ("/recap",    "AI-written recap: technical analysis of what's working"),
         ("/trades",   "Last 7 days trade history"),
+        ("/daily",    "Today's recap — trades, P&L, eval status + sheet row"),
+        ("/weekly",   "This week's recap — full stats + sheet rows"),
+        ("/sheet",    "Copy-paste spreadsheet block for all recent trades"),
     ],
     "📥 Training Data": [
         ("/gm",       "Log a Goldmine callout  e.g. /gm SELL 5 30185 30095 30070 30020 SL:30225"),
@@ -283,6 +302,18 @@ def handle_tg_command(text):
             f"TP3 [{c3} MNQ]: {tp3_str}\n"
             f"SL:            <code>{sl}</code>  ({abs(price-sl):.0f}pts away)"
         )
+
+    # ── /daily ─────────────────────────────────────────────────────
+    elif any(w in text for w in ["/daily", "daily", "today", "day recap"]):
+        send_daily_summary()
+
+    # ── /weekly ────────────────────────────────────────────────────
+    elif any(w in text for w in ["/weekly", "weekly", "week recap", "this week"]):
+        send_weekly_summary()
+
+    # ── /sheet ─────────────────────────────────────────────────────
+    elif any(w in text for w in ["/sheet", "sheet", "spreadsheet", "copy paste", "export"]):
+        send_sheet_export()
 
     # ── /recap ─────────────────────────────────────────────────────
     elif any(w in text for w in ["/recap", "recap", "how we doing", "performance", "summary"]):
@@ -916,24 +947,41 @@ def auto_enter_trade(signal):
 
     bias = signal.get("bias")
     pre  = signal.get("pre_trend", "?")
+    lt   = signal.get("long_trend", "?")
     if signal["side"] == "BUY":
-        setup_str = "Dip buy" if pre == "DOWN" else "Continuation buy"
+        setup_str = "Dip buy — short pullback in uptrend" if pre == "DOWN" else "Continuation — trend still climbing"
     else:
-        setup_str = "Fade sell" if pre == "UP" else "Continuation sell"
-    bias_str = f"  |  {'🔄 ' + bias + ' bias' if bias else ''}" if bias else ""
+        setup_str = "Fade sell — push into downtrend" if pre == "UP" else "Continuation — trend still falling"
+
+    # Pull multi-timeframe context for the entry message
+    candles = get_15min_candles()
+    mid_closes  = [c["c"] for c in candles[-10:]] if len(candles) >= 10 else []
+    short_closes = [c["c"] for c in candles[-3:]] if len(candles) >= 3 else []
+    long_closes  = [c["c"] for c in candles[-20:]] if len(candles) >= 20 else []
+    long_move  = round(long_closes[-1] - long_closes[0], 0) if len(long_closes) >= 2 else 0
+    mid_move   = round(mid_closes[-1] - mid_closes[0], 0) if len(mid_closes) >= 2 else 0
+    short_move = round(short_closes[-1] - short_closes[0], 0) if len(short_closes) >= 2 else 0
+    bias_str   = f"  |  🔄 {bias} bias" if bias else ""
+
+    ev = get_eval_status()
 
     tg_send(
         f"{side_emoji} <b>JARVIS ENTERED — #{logged['id']}</b>\n\n"
         f"<b>{signal['side']} {signal['contracts']} MNQ</b> @ <code>{signal['entry']}</code>\n\n"
+        f"<b>Why:</b>\n"
+        f"  5hr:   {lt} ({long_move:+.0f}pts)\n"
+        f"  2.5hr: {'DOWN' if mid_move < 0 else 'UP'} ({mid_move:+.0f}pts)\n"
+        f"  45min: {'DOWN' if short_move < 0 else 'UP'} ({short_move:+.0f}pts)\n"
+        f"  → {setup_str}{bias_str}\n\n"
         f"SL:  <code>{signal['sl']}</code>  (−${risk_usd})\n"
-        f"TP1: <code>{signal['tp1']}</code>  close {c1} MNQ → +${tp1_usd}\n"
-        f"TP2: <code>{signal['tp2']}</code>  close {c2} MNQ → +${tp2_usd}  ← SL to BE\n"
-        f"TP3: <code>{signal['tp3']}</code>  close {c3} MNQ → +${tp3_usd}\n"
+        f"TP1: <code>{signal['tp1']}</code>  {c1}MNQ → +${tp1_usd}\n"
+        f"TP2: <code>{signal['tp2']}</code>  {c2}MNQ → +${tp2_usd}  ← SL→BE\n"
+        f"TP3: <code>{signal['tp3']}</code>  {c3}MNQ → +${tp3_usd}\n"
         f"Max: <b>+${max_usd}</b>\n\n"
-        f"📊 {signal['session']} ({session_wr}% WR)  |  {aligned_str}\n"
-        f"💡 {setup_str}  ({signal['strength']:.0f}pt move)  |  Bigger trend {signal.get('long_trend','?')}{bias_str}\n"
-        + (f"{form_str}\n" if form_str else "") +
-        f"\n/progress for live update 🤖"
+        f"🏦 Eval: ${ev['eval_balance']:,.2f}  |  ${ev['to_target']:,.0f} to pass  |  ${ev['to_floor']:,.0f} DD left\n"
+        f"📊 {signal['session']} ({session_wr}% WR)  |  {aligned_str}"
+        + (f"\n{form_str}" if form_str else "") +
+        f"\n\n/progress for live updates 🤖"
     )
     return logged["id"]
 
@@ -1014,22 +1062,35 @@ def check_open_jarvis_trades():
                 "pnl_pts": round(pts, 2), "pnl_usd": pnl_usd,
                 "closed_at": datetime.now().isoformat()
             })
+
+            # Set cooldown — Win=30min, Loss=60min
+            if result == "WIN":
+                _cooldown["until"]  = time.time() + 1800
+                _cooldown["reason"] = "WIN — 30min cooldown"
+            else:
+                _cooldown["until"]  = time.time() + 3600
+                _cooldown["reason"] = "LOSS — 60min cooldown"
+
+            ev = get_eval_status()
             if result == "WIN":
                 tps = " → ".join([x for x, h in [("TP1", tp1h), ("TP2", tp2h), ("TP3", tp3h)] if h])
                 msg = (
                     f"✅ <b>WIN — #{trade['id']}</b>\n\n"
                     f"{side} {contracts}MNQ  |  {tps}\n"
                     f"+{round(pts)}pts  |  <b>+${pnl_usd:,.2f}</b>\n\n"
-                    f"Back to watching. 👀"
+                    f"🏦 Eval: ${ev['eval_balance']:,.2f}  (${ev['to_target']:,.0f} to target)\n"
+                    f"Cooling down 30min. Back to watching. 👀"
                 )
             else:
                 msg = (
                     f"❌ <b>LOSS — #{trade['id']}</b>\n\n"
                     f"{side} {contracts}MNQ  |  SL hit @ <code>{sl}</code>\n"
                     f"{round(pts)}pts  |  <b>−${abs(pnl_usd):,.2f}</b>\n\n"
-                    f"Part of the game. Back to watching."
+                    f"🏦 Eval: ${ev['eval_balance']:,.2f}  (${ev['to_floor']:,.0f} DD buffer left)\n"
+                    f"Cooling down 60min. Back to watching."
                 )
             tg_send(msg)
+            push_trade_to_sheets(trade["id"])
 
 def send_market_analysis():
     """Full market read — what Jarvis sees right now, where it thinks price goes, what it needs for a setup."""
@@ -1152,6 +1213,246 @@ Recent trade bias: {bias or 'neutral'}
         f"{ai_read}\n\n"
         f"<b>Setup status:</b>\n{setup_needed}"
     )
+
+# ── Google Sheets ─────────────────────────────────────────────────
+def get_gsheet():
+    """Return (worksheet_trades, worksheet_daily, worksheet_weekly, worksheet_eval) or None."""
+    if not GSPREAD_OK or not GOOGLE_SHEET_ID or not GOOGLE_CREDS:
+        return None
+    try:
+        creds_dict = json.loads(GOOGLE_CREDS)
+        creds = GCredentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://spreadsheets.google.com/feeds",
+                    "https://www.googleapis.com/auth/drive"]
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+
+        # Get or create tabs
+        def get_or_create(name, headers):
+            try:
+                ws = sh.worksheet(name)
+            except gspread.WorksheetNotFound:
+                ws = sh.add_worksheet(title=name, rows=1000, cols=len(headers))
+                ws.append_row(headers)
+            return ws
+
+        trades_ws = get_or_create("Trade Log", [
+            "Date","Time","Trade ID","Direction","Size MNQ","Entry","Stop",
+            "TP1","TP2","TP3","TP Hit","Result","Points","P&L","Balance After",
+            "To Pass","To Fail","Eval #","Session","Notes"
+        ])
+        daily_ws = get_or_create("Daily Recaps", [
+            "Date","Trades","Wins","Losses","Win Rate","Total P&L","Avg Win",
+            "Avg Loss","Best Trade","Worst Trade","Balance EOD","To Pass","To Fail","Eval Status"
+        ])
+        weekly_ws = get_or_create("Weekly Recaps", [
+            "Week Start","Week End","Trades","Wins","Losses","Win Rate","Total P&L",
+            "Avg Win","Avg Loss","Profit Factor","Max DD","Best","Worst",
+            "Eval Passed?","Eval Failed?","Ending Balance"
+        ])
+        eval_ws = get_or_create("Eval Simulator", [
+            "Eval #","Start Date","End Date","Trades","Final Balance","Result",
+            "Max Drawdown","Total P&L","Days"
+        ])
+        return trades_ws, daily_ws, weekly_ws, eval_ws
+    except Exception as e:
+        print(f"[SHEETS] Error: {e}")
+        return None
+
+def trade_to_sheet_row(trade):
+    """Convert a trade dict to a spreadsheet row."""
+    ev = get_eval_status()
+    dt  = (trade.get("trade_date") or "")
+    tp_hit = ("TP3" if trade.get("tp3_hit") else
+              "TP2" if trade.get("tp2_hit") else
+              "TP1" if trade.get("tp1_hit") else
+              "SL"  if trade.get("sl_hit")  else "OPEN")
+    notes = trade.get("notes","")
+    session = notes.split("Session:")[-1].split()[0] if "Session:" in notes else ""
+    return [
+        dt[:10], dt[11:16],
+        trade.get("id",""), trade.get("side",""), trade.get("contracts",""),
+        trade.get("entry",""), trade.get("sl",""),
+        trade.get("tp1",""), trade.get("tp2",""), trade.get("tp3",""),
+        tp_hit, trade.get("result",""),
+        trade.get("pnl_pts",""), trade.get("pnl_usd",""),
+        ev["eval_balance"], ev["to_target"], ev["to_floor"],
+        ev["eval_num"], session, notes[:80]
+    ]
+
+def push_trade_to_sheets(trade_id):
+    """Auto-push a completed trade to Google Sheets if configured."""
+    try:
+        sheets = get_gsheet()
+        if not sheets: return
+        trades_ws = sheets[0]
+        trade = sb_select("trades", {"id": trade_id})
+        if not trade: return
+        row = trade_to_sheet_row(trade[0])
+        trades_ws.append_row(row)
+        print(f"[SHEETS] Trade #{trade_id} pushed")
+    except Exception as e:
+        print(f"[SHEETS] Push error: {e}")
+
+def format_sheet_row(trade):
+    """Return a single pipe-delimited row for copy-paste."""
+    ev = get_eval_status()
+    dt   = (trade.get("trade_date") or "")
+    tp_hit = ("TP3" if trade.get("tp3_hit") else
+              "TP2" if trade.get("tp2_hit") else
+              "TP1" if trade.get("tp1_hit") else
+              "SL"  if trade.get("sl_hit")  else "OPEN")
+    notes = trade.get("notes","")
+    session = notes.split("Session:")[-1].split()[0] if "Session:" in notes else "-"
+    pnl = trade.get("pnl_usd") or 0
+    return (f"{dt[:10]} | {dt[11:16]} | #{trade.get('id','')} | "
+            f"{trade.get('side','')} | {trade.get('contracts','')}MNQ | "
+            f"{trade.get('entry','')} | {trade.get('sl','')} | "
+            f"{trade.get('tp1','')} | {trade.get('tp2','')} | {trade.get('tp3','')} | "
+            f"{tp_hit} | {trade.get('result','')} | ${pnl:+.2f} | "
+            f"${ev['eval_balance']:,.2f} | ${ev['to_target']:,.0f} | ${ev['to_floor']:,.0f} | "
+            f"{session}")
+
+def send_sheet_export():
+    """Output last 10 trades as copy-paste spreadsheet rows."""
+    trades = sb_select("trades", extra="&source=eq.JARVIS&order=id.desc&limit=10")
+    done   = [t for t in trades if t.get("result") in ("WIN","LOSS")]
+    if not done:
+        tg_send("No completed trades yet.")
+        return
+    header = "Date | Time | ID | Dir | Size | Entry | SL | TP1 | TP2 | TP3 | TP Hit | Result | P&L | Eval Bal | To Pass | DD Left | Session"
+    rows   = "\n".join(format_sheet_row(t) for t in done[:10])
+    tg_send(f"📋 <b>Sheet Export</b>\n\n<code>{header}\n{rows}</code>")
+
+def send_daily_summary():
+    """Today's performance recap + sheet row."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    trades = sb_select("trades", extra=f"&source=eq.JARVIS&order=id.asc")
+    today_trades = [t for t in trades if (t.get("trade_date") or "")[:10] == today]
+    done   = [t for t in today_trades if t.get("result") in ("WIN","LOSS")]
+    open_t = [t for t in today_trades if t.get("result") == "OPEN"]
+
+    ev = get_eval_status()
+
+    if not done and not open_t:
+        tg_send(f"📅 <b>Daily — {today}</b>\n\nNo trades today. Jarvis was watching but conditions weren't right.")
+        return
+
+    wins   = [t for t in done if t["result"] == "WIN"]
+    losses = [t for t in done if t["result"] == "LOSS"]
+    pnls   = [t.get("pnl_usd") or 0 for t in done]
+    total_pnl = sum(pnls)
+    wr  = round(len(wins) / max(len(done), 1) * 100)
+    best  = max(pnls) if pnls else 0
+    worst = min(pnls) if pnls else 0
+
+    trade_lines = ""
+    for t in today_trades:
+        tp_hit = ("TP3" if t.get("tp3_hit") else "TP2" if t.get("tp2_hit") else "TP1" if t.get("tp1_hit") else "SL" if t.get("sl_hit") else "OPEN")
+        emoji  = "✅" if t.get("result") == "WIN" else "❌" if t.get("result") == "LOSS" else "🟡"
+        pnl    = t.get("pnl_usd") or 0
+        notes  = t.get("notes","")
+        sess   = notes.split("Session:")[-1].split()[0] if "Session:" in notes else ""
+        trade_lines += f"  {emoji} #{t['id']} {t['side']} {t.get('contracts',5)}MNQ @ {t.get('entry',0)} → {tp_hit}  ${pnl:+.0f}  {sess}\n"
+
+    eval_status = "✅ PASSED" if ev["eval_balance"] >= EVAL_TARGET else "❌ BLOWN" if ev["eval_balance"] <= EVAL_FLOOR else "🟡 Active"
+    sheet_row = (f"{today} | {len(done)} | {len(wins)} | {len(losses)} | {wr}% | "
+                 f"${total_pnl:+.2f} | ${best:+.2f} | ${worst:+.2f} | "
+                 f"${ev['eval_balance']:,.2f} | ${ev['to_target']:,.0f} | ${ev['to_floor']:,.0f} | {eval_status}")
+
+    tg_send(
+        f"📅 <b>Daily Recap — {today}</b>\n\n"
+        f"{trade_lines}\n"
+        f"Trades: {len(done)}  |  {len(wins)}W/{len(losses)}L  |  {wr}% WR\n"
+        f"P&L: <b>${total_pnl:+,.2f}</b>  |  Best: ${best:+.0f}  Worst: ${worst:+.0f}\n\n"
+        f"🏦 Eval #{ev['eval_num']}: <b>${ev['eval_balance']:,.2f}</b>  ({eval_status})\n"
+        f"To pass: ${ev['to_target']:,.0f}  |  DD buffer: ${ev['to_floor']:,.0f}\n\n"
+        f"<b>Sheet row:</b>\n<code>{sheet_row}</code>"
+    )
+
+    # Also push to Google Sheets if connected
+    try:
+        sheets = get_gsheet()
+        if sheets:
+            sheets[1].append_row(sheet_row.split(" | "))
+    except: pass
+
+def send_weekly_summary():
+    """This week's full stats + sheet rows."""
+    now   = datetime.now()
+    week_start = now - timedelta(days=now.weekday())  # Monday
+    week_start_str = week_start.strftime("%Y-%m-%d")
+    week_end_str   = now.strftime("%Y-%m-%d")
+
+    trades = sb_select("trades", extra=f"&source=eq.JARVIS&order=id.asc")
+    week_trades = [t for t in trades
+                   if (t.get("trade_date") or "")[:10] >= week_start_str]
+    done = [t for t in week_trades if t.get("result") in ("WIN","LOSS")]
+
+    if not done:
+        tg_send(f"📆 <b>Weekly — {week_start_str} to {week_end_str}</b>\n\nNo completed trades this week.")
+        return
+
+    wins   = [t for t in done if t["result"] == "WIN"]
+    losses = [t for t in done if t["result"] == "LOSS"]
+    pnls   = [t.get("pnl_usd") or 0 for t in done]
+    win_pnls  = [t.get("pnl_usd") or 0 for t in wins]
+    loss_pnls = [abs(t.get("pnl_usd") or 0) for t in losses]
+    total_pnl = sum(pnls)
+    wr  = round(len(wins) / max(len(done), 1) * 100)
+    avg_win  = round(sum(win_pnls) / max(len(win_pnls), 1), 2)
+    avg_loss = round(sum(loss_pnls) / max(len(loss_pnls), 1), 2)
+    pf       = round(sum(win_pnls) / max(sum(loss_pnls), 0.01), 2)
+    best     = max(pnls) if pnls else 0
+    worst    = min(pnls) if pnls else 0
+
+    # Max drawdown this week (running balance)
+    running = EVAL_START
+    peak    = EVAL_START
+    max_dd  = 0
+    for t in done:
+        running += (t.get("pnl_usd") or 0)
+        peak     = max(peak, running)
+        max_dd   = max(max_dd, peak - running)
+
+    ev = get_eval_status()
+    eval_passed = ev["funded"]
+    eval_blown  = ev["blown"]
+
+    # Per-session breakdown
+    sess_stats = {}
+    for t in done:
+        notes = t.get("notes","")
+        s = notes.split("Session:")[-1].split()[0] if "Session:" in notes else "Other"
+        if s not in sess_stats: sess_stats[s] = {"W":0,"L":0}
+        if t["result"] == "WIN": sess_stats[s]["W"] += 1
+        else: sess_stats[s]["L"] += 1
+    sess_lines = "  ".join([f"{s}: {v['W']}W/{v['L']}L" for s, v in sess_stats.items()])
+
+    sheet_row = (f"{week_start_str} | {week_end_str} | {len(done)} | {len(wins)} | {len(losses)} | "
+                 f"{wr}% | ${total_pnl:+.2f} | ${avg_win:.2f} | ${avg_loss:.2f} | "
+                 f"{pf} | ${max_dd:.2f} | ${best:+.2f} | ${worst:+.2f} | "
+                 f"{eval_passed} | {eval_blown} | ${ev['eval_balance']:,.2f}")
+
+    tg_send(
+        f"📆 <b>Weekly Recap — {week_start_str} → {week_end_str}</b>\n\n"
+        f"Trades: {len(done)}  |  {len(wins)}W/{len(losses)}L  |  <b>{wr}% WR</b>\n"
+        f"P&L: <b>${total_pnl:+,.2f}</b>\n"
+        f"Avg win: ${avg_win:+.2f}  |  Avg loss: -${avg_loss:.2f}\n"
+        f"Profit factor: {pf}  |  Max DD: ${max_dd:.2f}\n"
+        f"Best: ${best:+.0f}  |  Worst: ${worst:+.0f}\n\n"
+        f"Sessions: {sess_lines}\n\n"
+        f"🏦 Evals: {eval_passed} passed  |  {eval_blown} blown  |  Balance ${ev['eval_balance']:,.2f}\n\n"
+        f"<b>Sheet row:</b>\n<code>{sheet_row}</code>"
+    )
+
+    try:
+        sheets = get_gsheet()
+        if sheets:
+            sheets[2].append_row(sheet_row.split(" | "))
+    except: pass
 
 def send_trade_history():
     """Last 7 days of Jarvis trades."""
@@ -1370,9 +1671,11 @@ def background_monitor():
             signal, msg = check_for_signal()
             if signal:
                 price = signal["entry"]
-                # Only skip if price hasn't moved at least 25pts since last entry
-                # — different price level = genuinely new setup
-                if last_entry_price is None or abs(price - last_entry_price) >= 25:
+                # Cooldown check — don't re-enter during cooldown period
+                if time.time() < _cooldown["until"]:
+                    mins_left = round((_cooldown["until"] - time.time()) / 60)
+                    print(f"[SIGNAL] Blocked by cooldown ({_cooldown['reason']}, {mins_left}min left)")
+                elif last_entry_price is None or abs(price - last_entry_price) >= 25:
                     log_signal(signal)
                     auto_enter_trade(signal)
                     last_entry_price = price
