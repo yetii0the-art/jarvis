@@ -11,18 +11,10 @@ import anthropic
 from datetime import datetime, timedelta
 from flask import Flask, render_template, jsonify, request
 
-# optional Google Sheets
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials as GCredentials
-    GSPREAD_OK = True
-except ImportError:
-    GSPREAD_OK = False
 
 # ── Config ────────────────────────────────────────────────────────
 POLYGON_KEY    = os.environ["POLYGON_API_KEY"]
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
-GOOGLE_CREDS    = os.environ.get("GOOGLE_CREDS_JSON", "")  # service account JSON as string
+GOOGLE_SHEETS_URL = os.environ.get("GOOGLE_SHEETS_URL", "")  # Apps Script web app URL
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 SUPABASE_URL   = os.environ["SUPABASE_URL"]
 SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
@@ -1091,6 +1083,74 @@ def check_open_jarvis_trades():
                 )
             tg_send(msg)
             push_trade_to_sheets(trade["id"])
+            threading.Thread(target=send_post_trade_analysis,
+                             args=(trade, result, pnl_usd, tp1h, tp2h, tp3h, slh, pts),
+                             daemon=True).start()
+
+def send_post_trade_analysis(trade, result, pnl_usd, tp1h, tp2h, tp3h, slh, pts):
+    """
+    Fire during cooldown after trade closes.
+    Uses Claude to analyze what happened and what to watch for next.
+    """
+    time.sleep(5)  # small delay so it doesn't collide with the close message
+    side      = trade.get("side")
+    entry     = trade.get("entry")
+    sl        = trade.get("sl")
+    tp1       = trade.get("tp1")
+    tp2       = trade.get("tp2")
+    tp3       = trade.get("tp3")
+    contracts = trade.get("contracts", 5)
+    notes     = trade.get("notes","")
+    session   = notes.split("Session:")[-1].split()[0] if "Session:" in notes else "?"
+    strength  = notes.split("Strength:")[-1].split()[0] if "Strength:" in notes else "?"
+    aligned   = "aligned" if "Aligned:True" in notes else "counter-trend"
+
+    tp_reached = ("TP3" if tp3h else "TP2" if tp2h else "TP1" if tp1h else "none — SL hit")
+    cooldown_mins = 30 if result == "WIN" else 60
+    price_now = get_live_price() or entry
+
+    ai_text = ""
+    if ANTHROPIC_KEY:
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            msg = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=200,
+                messages=[{"role":"user","content":
+                    f"""You are Jarvis, MNQ trading algo. A trade just closed. Give a quick 2-3 sentence analysis like a sharp trading partner reviewing the tape. Be specific to the numbers, not generic.
+
+Trade: {side} {contracts}MNQ @ {entry}
+SL: {sl}  TP1: {tp1}  TP2: {tp2}  TP3: {tp3}
+Result: {result} — reached {tp_reached} — P&L: ${pnl_usd:+.2f}
+Session: {session}  Pre-trend strength: {strength}pts  Direction: {aligned}
+Current price: {price_now}
+
+Cover: what the trade did (did it move cleanly or chop?), one pattern worth noting, and what the cooldown period should focus on watching for."""
+                }]
+            )
+            ai_text = msg.content[0].text
+        except:
+            pass
+
+    if not ai_text:
+        if result == "WIN":
+            ai_text = (f"Reached {tp_reached} — {'clean move, trend held' if tp3h else 'partial, reversed before TP3'}. "
+                       f"Cooldown: watch for next pullback to form cleanly.")
+        else:
+            ai_text = (f"SL hit — price moved {round(abs(price_now - entry))}pts against entry. "
+                       f"Reassessing direction over the next hour before next trade.")
+
+    candles      = get_15min_candles()
+    long_closes  = [c["c"] for c in candles[-20:]] if len(candles) >= 20 else []
+    long_trend   = ("DOWN" if long_closes[-1] < long_closes[0] else "UP") if len(long_closes) >= 2 else "?"
+    long_move    = round(long_closes[-1] - long_closes[0], 0) if len(long_closes) >= 2 else 0
+
+    tg_send(
+        f"🔍 <b>Post-trade read</b>\n\n"
+        f"{ai_text}\n\n"
+        f"Bigger trend still: <b>{long_trend}</b> ({long_move:+.0f}pts 5hr)\n"
+        f"Cooling down {cooldown_mins}min — next entry after {(datetime.now() + timedelta(minutes=cooldown_mins)).strftime('%H:%M')}"
+    )
 
 def send_market_analysis():
     """Full market read — what Jarvis sees right now, where it thinks price goes, what it needs for a setup."""
@@ -1214,87 +1274,60 @@ Recent trade bias: {bias or 'neutral'}
         f"<b>Setup status:</b>\n{setup_needed}"
     )
 
-# ── Google Sheets ─────────────────────────────────────────────────
-def get_gsheet():
-    """Return (worksheet_trades, worksheet_daily, worksheet_weekly, worksheet_eval) or None."""
-    if not GSPREAD_OK or not GOOGLE_SHEET_ID or not GOOGLE_CREDS:
-        return None
+# ── Google Sheets (Apps Script webhook) ───────────────────────────
+def sheets_post(payload):
+    """POST to Google Apps Script web app. No OAuth needed."""
+    if not GOOGLE_SHEETS_URL:
+        return
     try:
-        creds_dict = json.loads(GOOGLE_CREDS)
-        creds = GCredentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://spreadsheets.google.com/feeds",
-                    "https://www.googleapis.com/auth/drive"]
-        )
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
-
-        # Get or create tabs
-        def get_or_create(name, headers):
-            try:
-                ws = sh.worksheet(name)
-            except gspread.WorksheetNotFound:
-                ws = sh.add_worksheet(title=name, rows=1000, cols=len(headers))
-                ws.append_row(headers)
-            return ws
-
-        trades_ws = get_or_create("Trade Log", [
-            "Date","Time","Trade ID","Direction","Size MNQ","Entry","Stop",
-            "TP1","TP2","TP3","TP Hit","Result","Points","P&L","Balance After",
-            "To Pass","To Fail","Eval #","Session","Notes"
-        ])
-        daily_ws = get_or_create("Daily Recaps", [
-            "Date","Trades","Wins","Losses","Win Rate","Total P&L","Avg Win",
-            "Avg Loss","Best Trade","Worst Trade","Balance EOD","To Pass","To Fail","Eval Status"
-        ])
-        weekly_ws = get_or_create("Weekly Recaps", [
-            "Week Start","Week End","Trades","Wins","Losses","Win Rate","Total P&L",
-            "Avg Win","Avg Loss","Profit Factor","Max DD","Best","Worst",
-            "Eval Passed?","Eval Failed?","Ending Balance"
-        ])
-        eval_ws = get_or_create("Eval Simulator", [
-            "Eval #","Start Date","End Date","Trades","Final Balance","Result",
-            "Max Drawdown","Total P&L","Days"
-        ])
-        return trades_ws, daily_ws, weekly_ws, eval_ws
+        requests.post(GOOGLE_SHEETS_URL, json=payload, timeout=8)
+        print(f"[SHEETS] Pushed: {payload.get('action')}")
     except Exception as e:
         print(f"[SHEETS] Error: {e}")
-        return None
-
-def trade_to_sheet_row(trade):
-    """Convert a trade dict to a spreadsheet row."""
-    ev = get_eval_status()
-    dt  = (trade.get("trade_date") or "")
-    tp_hit = ("TP3" if trade.get("tp3_hit") else
-              "TP2" if trade.get("tp2_hit") else
-              "TP1" if trade.get("tp1_hit") else
-              "SL"  if trade.get("sl_hit")  else "OPEN")
-    notes = trade.get("notes","")
-    session = notes.split("Session:")[-1].split()[0] if "Session:" in notes else ""
-    return [
-        dt[:10], dt[11:16],
-        trade.get("id",""), trade.get("side",""), trade.get("contracts",""),
-        trade.get("entry",""), trade.get("sl",""),
-        trade.get("tp1",""), trade.get("tp2",""), trade.get("tp3",""),
-        tp_hit, trade.get("result",""),
-        trade.get("pnl_pts",""), trade.get("pnl_usd",""),
-        ev["eval_balance"], ev["to_target"], ev["to_floor"],
-        ev["eval_num"], session, notes[:80]
-    ]
 
 def push_trade_to_sheets(trade_id):
-    """Auto-push a completed trade to Google Sheets if configured."""
+    """Push a completed trade to Google Sheets."""
+    if not GOOGLE_SHEETS_URL:
+        return
     try:
-        sheets = get_gsheet()
-        if not sheets: return
-        trades_ws = sheets[0]
         trade = sb_select("trades", {"id": trade_id})
         if not trade: return
-        row = trade_to_sheet_row(trade[0])
-        trades_ws.append_row(row)
-        print(f"[SHEETS] Trade #{trade_id} pushed")
+        t  = trade[0]
+        ev = get_eval_status()
+        dt = (t.get("trade_date") or "")
+        tp_hit = ("TP3" if t.get("tp3_hit") else
+                  "TP2" if t.get("tp2_hit") else
+                  "TP1" if t.get("tp1_hit") else
+                  "SL"  if t.get("sl_hit")  else "OPEN")
+        notes   = t.get("notes","")
+        session = notes.split("Session:")[-1].split()[0] if "Session:" in notes else ""
+        why_str = notes.split("Strength:")[-1][:40] if "Strength:" in notes else notes[:40]
+
+        sheets_post({
+            "action":       "log_trade",
+            "date":         dt[:10],
+            "time":         dt[11:16],
+            "trade_id":     t.get("id"),
+            "side":         t.get("side"),
+            "contracts":    t.get("contracts"),
+            "entry":        t.get("entry"),
+            "sl":           t.get("sl"),
+            "tp1":          t.get("tp1"),
+            "tp2":          t.get("tp2"),
+            "tp3":          t.get("tp3"),
+            "tp_hit":       tp_hit,
+            "result":       t.get("result"),
+            "pnl_pts":      t.get("pnl_pts"),
+            "pnl_usd":      t.get("pnl_usd"),
+            "eval_balance": ev["eval_balance"],
+            "to_pass":      ev["to_target"],
+            "dd_left":      ev["to_floor"],
+            "eval_num":     ev["eval_num"],
+            "session":      session,
+            "why":          why_str,
+        })
     except Exception as e:
-        print(f"[SHEETS] Push error: {e}")
+        print(f"[SHEETS] push_trade error: {e}")
 
 def format_sheet_row(trade):
     """Return a single pipe-delimited row for copy-paste."""
@@ -1372,12 +1405,12 @@ def send_daily_summary():
         f"<b>Sheet row:</b>\n<code>{sheet_row}</code>"
     )
 
-    # Also push to Google Sheets if connected
-    try:
-        sheets = get_gsheet()
-        if sheets:
-            sheets[1].append_row(sheet_row.split(" | "))
-    except: pass
+    sheets_post({"action":"log_daily","date":today,"trades":len(done),
+        "wins":len(wins),"losses":len(losses),"win_rate":f"{wr}%",
+        "total_pnl":total_pnl,"avg_win":round(sum(pnls)/max(len(wins),1),2) if wins else 0,
+        "avg_loss":round(abs(sum(t.get("pnl_usd",0) or 0 for t in losses))/max(len(losses),1),2) if losses else 0,
+        "best":best,"worst":worst,"eval_balance":ev["eval_balance"],
+        "to_pass":ev["to_target"],"dd_left":ev["to_floor"],"eval_status":eval_status})
 
 def send_weekly_summary():
     """This week's full stats + sheet rows."""
@@ -1448,11 +1481,11 @@ def send_weekly_summary():
         f"<b>Sheet row:</b>\n<code>{sheet_row}</code>"
     )
 
-    try:
-        sheets = get_gsheet()
-        if sheets:
-            sheets[2].append_row(sheet_row.split(" | "))
-    except: pass
+    sheets_post({"action":"log_weekly","week_start":week_start_str,"week_end":week_end_str,
+        "trades":len(done),"wins":len(wins),"losses":len(losses),"win_rate":f"{wr}%",
+        "total_pnl":total_pnl,"avg_win":avg_win,"avg_loss":avg_loss,
+        "profit_factor":pf,"max_dd":max_dd,"best":best,"worst":worst,
+        "evals_passed":eval_passed,"evals_blown":eval_blown,"ending_balance":ev["eval_balance"]})
 
 def send_trade_history():
     """Last 7 days of Jarvis trades."""

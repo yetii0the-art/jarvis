@@ -5,5 +5,3 @@ yfinance
 pandas
 gunicorn
 websocket-client
-gspread
-google-auth
