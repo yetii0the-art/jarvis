@@ -40,10 +40,35 @@ _eval_checkpoints = []   # list of {"type": "funded"|"blown", "total_pnl": float
 _eval_alerted     = {"last": None}  # prevent repeat alerts
 
 # ── Trade Cooldown ────────────────────────────────────────────────
-# After a trade closes, wait before next entry.
-# Win: 30min cooldown  |  Loss: 60min cooldown
-# Mirrors Goldmine's 1-2 trades/day pace, prevents spam entries.
+# Win: 30min  |  Loss: 60min
+# Reads from DB so it survives Railway deploys/restarts.
 _cooldown = {"until": 0, "reason": ""}
+
+def get_cooldown_remaining():
+    """Check DB for last closed trade — return seconds remaining in cooldown."""
+    # First check in-memory (fast path)
+    remaining = _cooldown["until"] - time.time()
+    if remaining > 0:
+        return remaining, _cooldown["reason"]
+    # Fallback: check DB for last closed Jarvis trade
+    try:
+        trades = sb_select("trades", extra="&source=eq.JARVIS&order=id.desc&limit=1")
+        closed = [t for t in trades if t.get("result") in ("WIN","LOSS") and t.get("closed_at")]
+        if not closed:
+            return 0, ""
+        last = closed[0]
+        closed_at = datetime.fromisoformat(last["closed_at"].replace("Z",""))
+        elapsed   = (datetime.utcnow() - closed_at).total_seconds()
+        mins      = 30 if last["result"] == "WIN" else 60
+        remaining = (mins * 60) - elapsed
+        if remaining > 0:
+            reason = f"{last['result']} — {mins}min cooldown"
+            _cooldown["until"]  = time.time() + remaining
+            _cooldown["reason"] = reason
+            return remaining, reason
+    except:
+        pass
+    return 0, ""
 
 def get_scale(contracts):
     """
@@ -502,6 +527,21 @@ def start_ws():
         on_close=on_ws_close
     )
     ws.run_forever()
+
+def is_market_open():
+    """MNQ futures: Sun 6pm ET → Fri 5pm ET, daily break 5-6pm ET."""
+    now = datetime.now()
+    dow = now.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+    h   = now.hour
+    # Saturday — always closed
+    if dow == 5: return False
+    # Sunday — closed before 6pm ET
+    if dow == 6 and h < 18: return False
+    # Friday — closed at/after 5pm ET
+    if dow == 4 and h >= 17: return False
+    # Daily maintenance break 5-6pm ET every day
+    if h == 17: return False
+    return True
 
 def get_live_price():
     if _ws_price["price"] and time.time() - _ws_price["updated"] < 30:
@@ -1276,12 +1316,18 @@ Recent trade bias: {bias or 'neutral'}
 
 # ── Google Sheets (Apps Script webhook) ───────────────────────────
 def sheets_post(payload):
-    """POST to Google Apps Script web app. No OAuth needed."""
+    """POST to Google Apps Script web app. No OAuth needed.
+    Apps Script returns 302 redirect — must send as GET with params."""
     if not GOOGLE_SHEETS_URL:
         return
     try:
-        requests.post(GOOGLE_SHEETS_URL, json=payload, timeout=8)
-        print(f"[SHEETS] Pushed: {payload.get('action')}")
+        # Apps Script web apps require a GET with the payload as a query param
+        # OR a POST that follows the 302 redirect (which converts to GET)
+        import urllib.parse
+        data_str = urllib.parse.quote(json.dumps(payload))
+        url = f"{GOOGLE_SHEETS_URL}?data={data_str}"
+        r = requests.get(url, timeout=10)
+        print(f"[SHEETS] Pushed {payload.get('action')} — {r.status_code}")
     except Exception as e:
         print(f"[SHEETS] Error: {e}")
 
@@ -1698,20 +1744,45 @@ def background_monitor():
 
     while True:
         try:
+            # At market close (5pm ET) — close any open positions at last price
+            now_h = datetime.now().hour
+            now_dow = datetime.now().weekday()
+            if now_h == 17 and now_dow <= 4:  # 5pm Mon-Fri
+                open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
+                for t in open_trades:
+                    price = get_live_price() or t.get("entry", 0)
+                    entry = t.get("entry", 0)
+                    side  = t.get("side")
+                    pts   = (price - entry) if side == "BUY" else (entry - price)
+                    pnl   = round(pts * PTS_TO_USD * t.get("contracts", 5), 2)
+                    result = "WIN" if pts > 0 else "LOSS"
+                    sb_update("trades", t["id"], {
+                        "result": result, "pnl_pts": round(pts,2), "pnl_usd": pnl,
+                        "closed_at": datetime.now().isoformat(),
+                        "notes": (t.get("notes","") + " [closed at market close 5pm ET]")
+                    })
+                    tg_send(f"🔔 <b>Market close — Trade #{t['id']} closed</b>\n"
+                            f"{side} @ {entry} → {price}  |  ${pnl:+,.2f}\n"
+                            f"CME maintenance break. Back at 6pm ET.")
+                    push_trade_to_sheets(t["id"])
+
             check_open_jarvis_trades()
             check_eval_thresholds()
 
-            signal, msg = check_for_signal()
-            if signal:
-                price = signal["entry"]
-                # Cooldown check — don't re-enter during cooldown period
-                if time.time() < _cooldown["until"]:
-                    mins_left = round((_cooldown["until"] - time.time()) / 60)
-                    print(f"[SIGNAL] Blocked by cooldown ({_cooldown['reason']}, {mins_left}min left)")
-                elif last_entry_price is None or abs(price - last_entry_price) >= 25:
-                    log_signal(signal)
-                    auto_enter_trade(signal)
-                    last_entry_price = price
+            # Block signals when CME is closed
+            if not is_market_open():
+                print(f"[SIGNAL] Market closed — skipping")
+            else:
+                signal, msg = check_for_signal()
+                if signal:
+                    price = signal["entry"]
+                    cd_secs, cd_reason = get_cooldown_remaining()
+                    if cd_secs > 0:
+                        print(f"[SIGNAL] Cooldown {round(cd_secs/60)}min left ({cd_reason})")
+                    elif last_entry_price is None or abs(price - last_entry_price) >= 25:
+                        log_signal(signal)
+                        auto_enter_trade(signal)
+                        last_entry_price = price
 
             # Periodic chime every 20min on open trade
             open_trades = sb_select("trades", {"result": "OPEN", "source": "JARVIS"})
