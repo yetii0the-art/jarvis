@@ -36,8 +36,54 @@ PTS_TO_USD       = 2.0   # $2/pt per MNQ contract
 EVAL_START    = 50000
 EVAL_TARGET   = 53000   # +$3k = funded
 EVAL_FLOOR    = 48000   # -$2k = blown
-_eval_checkpoints = []   # list of {"type": "funded"|"blown", "total_pnl": float}
-_eval_alerted     = {"last": None}  # prevent repeat alerts
+_eval_alerted = {"last": None}  # prevent repeat alerts
+
+# ── Eval checkpoints — persisted to Supabase ─────────────────────
+def load_eval_checkpoints():
+    """Load eval checkpoints from Supabase signals_log (survives deploys)."""
+    try:
+        r = requests.get(
+            f"{SB_REST}/signals_log?select=*&notes=like.EVAL_CHECKPOINT%25&order=id.asc",
+            headers=SB_HEADERS, timeout=5
+        )
+        rows = r.json()
+        if not isinstance(rows, list):
+            return []
+        checkpoints = []
+        for row in rows:
+            try:
+                data = json.loads(row["notes"].replace("EVAL_CHECKPOINT:", ""))
+                checkpoints.append(data)
+            except:
+                pass
+        return checkpoints
+    except:
+        return []
+
+def save_eval_checkpoint(cp):
+    """Persist an eval checkpoint to Supabase."""
+    try:
+        sb_insert("signals_log", {
+            "side": "EVAL", "entry": 0, "sl": 0, "tp1": 0, "tp2": 0, "tp3": 0,
+            "contracts": 0, "session": "EVAL", "strength": 0, "taken": False, "skipped": False,
+            "notes": f"EVAL_CHECKPOINT:{json.dumps(cp)}"
+        })
+    except:
+        pass
+
+def reset_eval_checkpoints():
+    """Nuclear reset — wipe all eval checkpoints from DB. Use when data is corrupt."""
+    try:
+        requests.delete(
+            f"{SB_REST}/signals_log?notes=like.EVAL_CHECKPOINT%25",
+            headers=SB_HEADERS, timeout=5
+        )
+        print("[EVAL] Checkpoints reset")
+    except:
+        pass
+
+_eval_checkpoints = load_eval_checkpoints()
+print(f"[EVAL] Loaded {len(_eval_checkpoints)} checkpoints from DB")
 
 # ── Trade Cooldown ────────────────────────────────────────────────
 # Win: 30min  |  Loss: 60min
@@ -205,8 +251,17 @@ def handle_tg_command(text):
     text = original.lower()
     cmd  = text.split()[0] if text else ""
 
+    # ── /reseteval ─────────────────────────────────────────────────
+    if cmd == "/reseteval":
+        reset_eval_checkpoints()
+        _eval_checkpoints.clear()
+        _eval_alerted["last"] = None
+        ev = get_eval_status()
+        tg_send(f"🔄 <b>Eval reset</b>\n\nCheckpoints cleared. Starting fresh.\n"
+                f"Current P&L: ${ev['total_pnl']:+,.2f}  →  Eval balance: ${ev['eval_balance']:,.2f}")
+
     # ── /skip ──────────────────────────────────────────────────────
-    if cmd in ("/skip", "skip", "❌", "nah"):
+    elif cmd in ("/skip", "skip", "❌", "nah"):
         if _pending_signal["signal"]:
             log_signal(_pending_signal["signal"], skipped=True)
             _pending_signal["signal"] = None
@@ -832,7 +887,9 @@ def check_eval_thresholds():
 
     if bal >= EVAL_TARGET:
         _eval_alerted["last"] = key
-        _eval_checkpoints.append({"type": "funded", "total_pnl": ev["total_pnl"]})
+        cp = {"type": "funded", "total_pnl": ev["total_pnl"], "date": datetime.now().isoformat()}
+        _eval_checkpoints.append(cp)
+        save_eval_checkpoint(cp)
         ev2 = get_eval_status()
         tg_send(
             f"🏆 <b>EVAL FUNDED — #{ev['eval_num']}</b>\n\n"
@@ -842,7 +899,9 @@ def check_eval_thresholds():
         )
     elif bal <= EVAL_FLOOR:
         _eval_alerted["last"] = key
-        _eval_checkpoints.append({"type": "blown", "total_pnl": ev["total_pnl"]})
+        cp = {"type": "blown", "total_pnl": ev["total_pnl"], "date": datetime.now().isoformat()}
+        _eval_checkpoints.append(cp)
+        save_eval_checkpoint(cp)
         ev2 = get_eval_status()
         tg_send(
             f"💀 <b>EVAL BLOWN — #{ev['eval_num']}</b>\n\n"
