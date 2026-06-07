@@ -580,17 +580,24 @@ def on_ws_error(ws, error):
 
 def on_ws_close(ws, *args):
     _ws_connected["status"] = False
-    time.sleep(5)
-    start_ws()
+    print("[WS] Connection closed — loop will reconnect")
 
 def start_ws():
-    ws = websocket.WebSocketApp(
-        "wss://socket.polygon.io/futures",
-        on_message=on_ws_message,
-        on_error=on_ws_error,
-        on_close=on_ws_close
-    )
-    ws.run_forever()
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                "wss://socket.polygon.io/futures",
+                on_message=on_ws_message,
+                on_error=on_ws_error,
+                on_close=on_ws_close
+            )
+            # ping_interval keeps the TCP connection alive through Railway's idle timeout
+            # ping_timeout — if no pong in 10s, reconnect
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print(f"[WS] Crashed: {e}")
+        print("[WS] Reconnecting in 5s...")
+        time.sleep(5)
 
 def is_market_open():
     """MNQ futures: Sun 6pm ET → Fri 5pm ET, daily break 5-6pm ET."""
@@ -2168,22 +2175,44 @@ def background_monitor():
         time.sleep(30)
 
 # ── Startup — runs on import (works with gunicorn AND python app.py) ──
+def _yf_price():
+    """Pull latest price from yfinance 1-min NQ=F bars. ~15s delay but always live."""
+    try:
+        df = yf.Ticker("NQ=F").history(interval="1m", period="1d")
+        if len(df) > 0:
+            return round(float(df["Close"].iloc[-1]), 2)
+    except:
+        pass
+    return None
+
 def price_heartbeat():
     """
-    Every 10s: if WebSocket price is >15s stale, fetch via REST.
-    Keeps price fresh even when WebSocket silently drops.
+    Every 10s: keep price fresh via REST then yfinance fallback.
+    WebSocket is primary. REST is first fallback. yfinance 1m is last resort.
+    yfinance has ~15s delay but is always live data during market hours.
     """
     while True:
         try:
             ws_age = time.time() - _ws_price["updated"] if _ws_price["updated"] else 9999
             if ws_age > 15:
+                # Try Polygon REST first
                 p = _rest_price()
+                source = "REST"
+                # If REST returns same price for >2min, it's probably stale — use yfinance
+                if p and p == _ws_price.get("price") and ws_age > 120:
+                    yf_p = _yf_price()
+                    if yf_p:
+                        p = yf_p
+                        source = "yfinance"
+                elif not p:
+                    p = _yf_price()
+                    source = "yfinance"
                 if p:
                     _ws_price["price"]   = p
                     _ws_price["updated"] = time.time()
-                    print(f"[PRICE] REST fallback: {p} (WS was {round(ws_age)}s stale)")
-        except:
-            pass
+                    print(f"[PRICE] {source} fallback: {p} (WS was {round(ws_age)}s stale)")
+        except Exception as e:
+            print(f"[PRICE] Heartbeat error: {e}")
         time.sleep(10)
 
 def _start_threads():
