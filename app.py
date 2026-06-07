@@ -607,20 +607,54 @@ def is_market_open():
     if h == 17: return False
     return True
 
-def get_live_price():
-    if _ws_price["price"] and time.time() - _ws_price["updated"] < 30:
-        return _ws_price["price"]
+def _rest_price():
+    """Pull latest MNQ front-month price from Polygon REST snapshot."""
     try:
         url = f"https://api.polygon.io/futures/v1/snapshot?product_code=MNQ&apiKey={POLYGON_KEY}"
         data = requests.get(url, timeout=5).json()
+        # Prefer active front month — pick the non-spread result with the highest volume / most recent trade
+        candidates = []
         for r in data.get("results", []):
-            if r.get("details", {}).get("ticker") == "MNQM6":
-                p = r.get("last_trade", {}).get("price")
-                if p:
-                    return float(p)
+            ticker = r.get("details", {}).get("ticker", "")
+            # Skip spreads (contain a dash)
+            if "-" in ticker:
+                continue
+            p = r.get("last_trade", {}).get("price")
+            if p:
+                candidates.append((ticker, float(p)))
+        if not candidates:
+            return None
+        # Prefer MNQM6 explicitly, otherwise take first outright
+        for ticker, price in candidates:
+            if ticker == "MNQM6":
+                return price
+        return candidates[0][1]
     except:
-        pass
-    return _ws_price["price"]
+        return None
+
+def get_live_price():
+    """
+    Return live MNQ price.
+    WebSocket is preferred (real-time ticks).
+    If WS price is >15s stale, fall back to REST immediately.
+    REST is also used as a background refresh every 10s.
+    """
+    ws_age = time.time() - _ws_price["updated"] if _ws_price["updated"] else 9999
+    if _ws_price["price"] and ws_age < 15:
+        return _ws_price["price"]
+    # WS stale — hit REST
+    p = _rest_price()
+    if p:
+        _ws_price["price"]   = p
+        _ws_price["updated"] = time.time()
+        return p
+    return _ws_price["price"]  # last known, even if stale
+
+def is_price_fresh():
+    """True if we have a price updated in the last 60 seconds."""
+    if not _ws_price["updated"]:
+        return False
+    return time.time() - _ws_price["updated"] < 60
 
 # ── 15-min candles (yfinance NQ=F) ───────────────────────────────
 _candle_cache = {"candles": [], "updated": 0}
@@ -796,6 +830,8 @@ def check_for_signal():
     price = get_live_price()
     if not price:
         return None, "No live price"
+    if not is_price_fresh():
+        return None, f"Price stale ({round(time.time()-_ws_price['updated'])}s old) — not trading"
 
     # ── Bigger trend direction (20 candles ≈ 5hrs) ────────────────
     long_closes = [c["c"] for c in candles[-20:]] if len(candles) >= 20 else [c["c"] for c in candles]
@@ -2132,10 +2168,29 @@ def background_monitor():
         time.sleep(30)
 
 # ── Startup — runs on import (works with gunicorn AND python app.py) ──
+def price_heartbeat():
+    """
+    Every 10s: if WebSocket price is >15s stale, fetch via REST.
+    Keeps price fresh even when WebSocket silently drops.
+    """
+    while True:
+        try:
+            ws_age = time.time() - _ws_price["updated"] if _ws_price["updated"] else 9999
+            if ws_age > 15:
+                p = _rest_price()
+                if p:
+                    _ws_price["price"]   = p
+                    _ws_price["updated"] = time.time()
+                    print(f"[PRICE] REST fallback: {p} (WS was {round(ws_age)}s stale)")
+        except:
+            pass
+        time.sleep(10)
+
 def _start_threads():
     threading.Thread(target=start_ws,           daemon=True).start()
     threading.Thread(target=background_monitor, daemon=True).start()
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
+    threading.Thread(target=price_heartbeat,    daemon=True).start()
 
 _start_threads()
 
