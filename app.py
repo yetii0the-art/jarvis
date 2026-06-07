@@ -308,6 +308,8 @@ def handle_tg_command(text):
             tp1_hit   = t.get("tp1_hit", False)
             tp2_hit   = t.get("tp2_hit", False)
             if price and entry:
+                tp1 = t.get("tp1", 0)
+                tp2 = t.get("tp2", 0)
                 unreal, remaining = calc_unrealized_pnl(entry, side, price, contracts, tp1_hit, tp2_hit)
                 c1, c2, _  = get_scale(contracts)
                 locked     = (c1*(tp1-entry if side=="BUY" else entry-tp1)*PTS_TO_USD if tp1_hit else 0) + (c2*(tp2-entry if side=="BUY" else entry-tp2)*PTS_TO_USD if tp2_hit else 0)
