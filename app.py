@@ -582,7 +582,16 @@ def on_ws_close(ws, *args):
     _ws_connected["status"] = False
     print("[WS] Connection closed — loop will reconnect")
 
+_ws_instance = {"ws": None}
+
 def start_ws():
+    """
+    Single persistent WebSocket to Polygon futures.
+    ping_interval=20 keeps Railway from killing the TCP connection.
+    On disconnect: wait 20s before reconnecting so Polygon releases
+    the old connection (plan allows 1 connection — immediate reconnect
+    hits max_connections and fails silently).
+    """
     while True:
         try:
             ws = websocket.WebSocketApp(
@@ -591,13 +600,14 @@ def start_ws():
                 on_error=on_ws_error,
                 on_close=on_ws_close
             )
-            # ping_interval keeps the TCP connection alive through Railway's idle timeout
-            # ping_timeout — if no pong in 10s, reconnect
+            _ws_instance["ws"] = ws
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             print(f"[WS] Crashed: {e}")
-        print("[WS] Reconnecting in 5s...")
-        time.sleep(5)
+        _ws_connected["status"] = False
+        print("[WS] Disconnected — waiting 20s for Polygon to release connection...")
+        time.sleep(20)
+        print("[WS] Reconnecting...")
 
 def is_market_open():
     """MNQ futures: Sun 6pm ET → Fri 5pm ET, daily break 5-6pm ET."""
