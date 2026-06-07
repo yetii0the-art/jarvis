@@ -642,20 +642,21 @@ def _rest_price():
 def get_live_price():
     """
     Return live MNQ price.
-    WebSocket is preferred (real-time ticks).
-    If WS price is >15s stale, fall back to REST immediately.
-    REST is also used as a background refresh every 10s.
+    1. WebSocket tick (real-time, Polygon)
+    2. yfinance 1m bar (~15s delay, always live)
+    3. Last known price
+    Polygon REST is excluded — it does not update live during session.
     """
     ws_age = time.time() - _ws_price["updated"] if _ws_price["updated"] else 9999
     if _ws_price["price"] and ws_age < 15:
         return _ws_price["price"]
-    # WS stale — hit REST
-    p = _rest_price()
+    # WS stale — use yfinance
+    p = _yf_price()
     if p:
         _ws_price["price"]   = p
         _ws_price["updated"] = time.time()
         return p
-    return _ws_price["price"]  # last known, even if stale
+    return _ws_price["price"]
 
 def is_price_fresh():
     """True if we have a price updated in the last 60 seconds."""
@@ -2187,30 +2188,20 @@ def _yf_price():
 
 def price_heartbeat():
     """
-    Every 10s: keep price fresh via REST then yfinance fallback.
-    WebSocket is primary. REST is first fallback. yfinance 1m is last resort.
-    yfinance has ~15s delay but is always live data during market hours.
+    Every 10s: keep price fresh.
+    WebSocket is primary (real-time ticks from Polygon).
+    When WS is stale >15s → yfinance 1m bars (always live, ~15s delay).
+    Polygon REST is skipped — it doesn't update live during session.
     """
     while True:
         try:
             ws_age = time.time() - _ws_price["updated"] if _ws_price["updated"] else 9999
             if ws_age > 15:
-                # Try Polygon REST first
-                p = _rest_price()
-                source = "REST"
-                # If REST returns same price for >2min, it's probably stale — use yfinance
-                if p and p == _ws_price.get("price") and ws_age > 120:
-                    yf_p = _yf_price()
-                    if yf_p:
-                        p = yf_p
-                        source = "yfinance"
-                elif not p:
-                    p = _yf_price()
-                    source = "yfinance"
+                p = _yf_price()
                 if p:
                     _ws_price["price"]   = p
                     _ws_price["updated"] = time.time()
-                    print(f"[PRICE] {source} fallback: {p} (WS was {round(ws_age)}s stale)")
+                    print(f"[PRICE] yfinance: {p} (WS was {round(ws_age)}s stale)")
         except Exception as e:
             print(f"[PRICE] Heartbeat error: {e}")
         time.sleep(10)
