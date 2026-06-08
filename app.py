@@ -101,10 +101,10 @@ def get_cooldown_remaining():
     remaining = _cooldown["until"] - time.time()
     if remaining > 0:
         return remaining, _cooldown["reason"]
-    # Fallback: check DB for last closed Jarvis trade
+    # Fallback: check DB for last CLOSED Jarvis trade specifically
     try:
-        trades = sb_select("trades", extra="&source=eq.JARVIS&order=id.desc&limit=1")
-        closed = [t for t in trades if t.get("result") in ("WIN","LOSS") and t.get("closed_at")]
+        trades = sb_select("trades", extra="&source=eq.JARVIS&result=in.(WIN,LOSS)&order=id.desc&limit=1")
+        closed = [t for t in trades if t.get("closed_at")]
         if not closed:
             return 0, ""
         last = closed[0]
