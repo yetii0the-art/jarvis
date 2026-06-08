@@ -1282,11 +1282,13 @@ def auto_enter_trade(signal):
         f"  → {setup_str}{bias_str}"
         f"{htf_str}"
         f"{htf_warn}\n\n"
-        f"SL:  <code>{signal['sl']}</code>  (−${risk_usd})\n"
-        f"TP1: <code>{signal['tp1']}</code>  {c1}MNQ → +${tp1_usd}\n"
-        f"TP2: <code>{signal['tp2']}</code>  {c2}MNQ → +${tp2_usd}  ← SL→BE\n"
-        f"TP3: <code>{signal['tp3']}</code>  {c3}MNQ → +${tp3_usd}\n"
-        f"Max: <b>+${max_usd}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💀 Risk:  {signal['contracts']}MNQ × 40pts = <b>−${risk_usd}</b>\n"
+        f"TP1: <code>{signal['tp1']}</code>  {c1}MNQ × 34pts = +${tp1_usd}\n"
+        f"TP2: <code>{signal['tp2']}</code>  {c2}MNQ × 65pts = +${tp2_usd}  ← SL→BE here\n"
+        f"TP3: <code>{signal['tp3']}</code>  {c3}MNQ × 100pts = +${tp3_usd}\n"
+        f"Max: <b>+${max_usd}</b>  |  R:R = 1:{round(max_usd/max(risk_usd,1), 1)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🏦 Eval: ${ev['eval_balance']:,.2f}  |  ${ev['to_target']:,.0f} to pass  |  ${ev['to_floor']:,.0f} DD left\n"
         f"📊 {signal['session']} ({session_wr}% WR)  |  {aligned_str}"
         + (f"\n{form_str}" if form_str else "") +
@@ -1337,30 +1339,41 @@ def check_open_jarvis_trades():
                 sl = entry  # use updated SL for rest of checks
                 trade["tp2_hit"] = True
 
+        # Read already-hit TPs from DB — must carry through to final P&L
+        tp1_already = trade.get("tp1_hit", False)
+        tp2_already = trade.get("tp2_hit", False)
+
         # Check for final resolution
         result = tp1h = tp2h = tp3h = slh = None
         pts = 0
 
         if side == "BUY":
             if tp3 and price >= tp3:
-                result="WIN"; tp1h=tp2h=tp3h=True; pts=tp3-entry
-            elif trade.get("tp2_hit") and price <= sl:
-                result="WIN"; tp1h=True; tp2h=True; tp3h=False; pts=sl-entry  # closed at BE = 0pts but WIN
-            elif tp1 and price >= tp1 and not trade.get("tp1_hit"):
+                result="WIN"; tp1h=tp2h=tp3h=True; slh=False; pts=tp3-entry
+            elif tp2_already and price <= sl:
+                # TP2 was hit, SL moved to BE — guaranteed win
+                result="WIN"; tp1h=True; tp2h=True; tp3h=False; slh=True; pts=0
+            elif tp1_already and price <= sl:
+                # TP1 was hit, then stopped — partial WIN (TP1 profit minus remaining loss)
+                result="WIN"; tp1h=True; tp2h=False; tp3h=False; slh=True; pts=tp1-entry
+            elif tp1 and price >= tp1 and not tp1_already:
                 sb_update("trades", trade["id"], {"tp1_hit": True})
-                tg_send(f"✅ TP1 hit — Trade #{trade['id']}  |  +{round(tp1-entry)}pts  |  Holding for TP2/TP3")
+                tg_send(f"✅ <b>TP1 hit</b> — Trade #{trade['id']}  |  +{round(tp1-entry)}pts on {c1}MNQ  |  Holding {c2+c3} for TP2/TP3")
             elif price <= sl:
-                result="LOSS"; slh=True; pts=sl-entry
+                result="LOSS"; tp1h=False; tp2h=False; tp3h=False; slh=True; pts=sl-entry
         else:
             if tp3 and price <= tp3:
-                result="WIN"; tp1h=tp2h=tp3h=True; pts=entry-tp3
-            elif trade.get("tp2_hit") and price >= sl:
-                result="WIN"; tp1h=True; tp2h=True; tp3h=False; pts=entry-sl
-            elif tp1 and price <= tp1 and not trade.get("tp1_hit"):
+                result="WIN"; tp1h=tp2h=tp3h=True; slh=False; pts=entry-tp3
+            elif tp2_already and price >= sl:
+                result="WIN"; tp1h=True; tp2h=True; tp3h=False; slh=True; pts=0
+            elif tp1_already and price >= sl:
+                # TP1 was hit, then stopped — partial WIN
+                result="WIN"; tp1h=True; tp2h=False; tp3h=False; slh=True; pts=entry-tp1
+            elif tp1 and price <= tp1 and not tp1_already:
                 sb_update("trades", trade["id"], {"tp1_hit": True})
-                tg_send(f"✅ TP1 hit — Trade #{trade['id']}  |  +{round(entry-tp1)}pts  |  Holding for TP2/TP3")
+                tg_send(f"✅ <b>TP1 hit</b> — Trade #{trade['id']}  |  +{round(entry-tp1)}pts on {c1}MNQ  |  Holding {c2+c3} for TP2/TP3")
             elif price >= sl:
-                result="LOSS"; slh=True; pts=entry-sl
+                result="LOSS"; tp1h=False; tp2h=False; tp3h=False; slh=True; pts=entry-sl
 
         if result:
             pnl_usd = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, contracts,
