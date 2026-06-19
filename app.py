@@ -800,6 +800,27 @@ def get_jarvis_form():
     reduce = streak <= -3 or wr < 30
     return wr, streak, reduce
 
+# ── Recent SELL form — consecutive SELL losses ────────────────────
+def get_recent_sell_form():
+    """
+    Returns consecutive SELL result streak (negative = losses).
+    Used to block SELLs after 2+ consecutive SELL losses.
+    """
+    try:
+        trades = sb_select("trades", extra="&source=eq.JARVIS&side=eq.SELL&result=in.(WIN,LOSS)&order=id.desc&limit=5")
+        if not trades:
+            return 0
+        streak = 0
+        last = trades[0]["result"]
+        for t in trades:
+            if t["result"] == last:
+                streak += 1
+            else:
+                break
+        return streak if last == "WIN" else -streak
+    except:
+        return 0
+
 # ── Directional Bias ──────────────────────────────────────────────
 def get_directional_bias():
     """
@@ -860,7 +881,12 @@ def check_for_signal():
     # ── Directional bias from recent trade history ─────────────────
     bias = get_directional_bias()
 
+    # ── Mid-trend (8 candles ≈ 2hrs) ──────────────────────────────
+    mid_closes = [c["c"] for c in candles[-8:]] if len(candles) >= 8 else [c["c"] for c in candles]
+    mid_trend  = "DOWN" if mid_closes[-1] < mid_closes[0] else "UP"
+
     # ── Determine side from pre-trend + bigger trend ───────────────
+    # Default lean: BUY. 59% WR vs 50% WR on SELLs — BUY is the edge.
     if pre_trend == "DOWN":
         side = "BUY" if long_trend == "UP" else "SELL"
     elif pre_trend == "UP":
@@ -868,17 +894,53 @@ def check_for_signal():
     else:
         return None, "No clear pre-trend"
 
-    # Bias override — counter-bias signal needs stronger pre-trend
-    if bias and bias != side:
-        if strength < 20:
-            return None, f"Pre-trend weak ({strength:.0f}pts) + counter to {bias} bias — skipping"
+    # ── SELL gate — A+++ setups only ──────────────────────────────
+    # Historical data: Overnight SELLs 42% WR, London SELLs 40% WR — no edge.
+    # NY (Friday) SELLs: 56% WR — the only session with sell edge.
+    # BUYs: 59% WR in ALL sessions — primary edge, default direction.
+    if side == "SELL":
+        # Rule 1: No SELLs outside NY Friday — data shows no edge elsewhere
+        if session_name != "NY":
+            # Force to BUY if conditions allow, else skip
+            if long_trend == "UP" and pre_trend == "DOWN":
+                side = "BUY"  # dip buy — this is what we want
+            elif long_trend == "UP" and pre_trend == "UP":
+                side = "BUY"  # continuation buy
+            else:
+                return None, f"No SELLs in {session_name} session (40-42% WR historically). Waiting for BUY setup."
 
+        # Rule 2: Must be fully trend-aligned — no counter-trend sells ever
+        if not (long_trend == "DOWN"):
+            return None, f"SELL blocked — 5hr trend is UP. Only buy dips in uptrends."
+
+        # Rule 3: Mid-trend must also confirm DOWN — triple timeframe agreement required
+        if mid_trend != "DOWN":
+            return None, f"SELL blocked — 2hr trend is {mid_trend}. Need 5hr+2hr+pre-trend all DOWN for a sell."
+
+        # Rule 4: Strength requirement is 3x higher for SELLs — need a real move
+        if strength < 30:
+            return None, f"SELL blocked — pre-trend only {strength:.0f}pts (need 30+ for sells, 10+ for buys)."
+
+        # Rule 5: Block SELLs when BUY bias is active — don't fight the tape
+        if bias == "BUY":
+            return None, f"SELL blocked — active BUY bias from recent trades. Not shorting into a buy streak."
+
+        # Rule 6: Check recent SELL form — 2+ consecutive sell losses → cool off
+        sell_form = get_recent_sell_form()
+        if sell_form <= -2:
+            return None, f"SELL blocked — {abs(sell_form)} consecutive SELL losses. Sitting out shorts."
+
+    # ── BUY filters (much lighter — BUYs are the primary weapon) ──
     # Minimum pre-trend strength — real move, not noise
     if strength < 10:
         return None, f"Pre-trend too weak ({strength:.0f}pts) — noise"
 
+    # Bias override — counter-bias BUY needs modest extra strength
+    if bias and bias != side and side == "BUY":
+        if strength < 15:
+            return None, f"BUY pre-trend weak ({strength:.0f}pts) + counter to {bias} bias — skipping"
+
     # ── Rule: Don't re-enter where we just got stopped out ────────
-    # If last SL hit was within 2hrs and new entry is within 30pts of that level → skip
     if (_last_sl["price"] and _last_sl["side"] == side and
             time.time() - _last_sl["time"] < 7200 and
             abs(price - _last_sl["price"]) < 30):
@@ -934,6 +996,7 @@ def check_for_signal():
         "strength":   round(strength, 1),
         "aligned":    aligned,
         "long_trend": long_trend,
+        "mid_trend":  mid_trend,
         "bias":       bias,
         "htf_note":   htf_note,
         "levels":     levels,
@@ -1277,9 +1340,10 @@ def auto_enter_trade(signal):
         f"<b>{signal['side']} {signal['contracts']} MNQ</b> @ <code>{signal['entry']}</code>\n\n"
         f"<b>Why:</b>\n"
         f"  5hr:   {lt} ({long_move:+.0f}pts)\n"
-        f"  2.5hr: {'DOWN' if mid_move < 0 else 'UP'} ({mid_move:+.0f}pts)\n"
+        f"  2hr:   {signal.get('mid_trend', ('DOWN' if mid_move < 0 else 'UP'))} ({mid_move:+.0f}pts)\n"
         f"  45min: {'DOWN' if short_move < 0 else 'UP'} ({short_move:+.0f}pts)\n"
-        f"  → {setup_str}{bias_str}"
+        + (f"  ⚠️ A+++ SELL — all 3 TFs DOWN, strength {signal.get('strength',0):.0f}pts, NY only\n" if signal["side"]=="SELL" else "")
+        + f"  → {setup_str}{bias_str}"
         f"{htf_str}"
         f"{htf_warn}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
