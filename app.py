@@ -510,12 +510,9 @@ def handle_tg_command(text):
         if len(parts) < 2:
             tg_send("Usage: /setaccount <account_id>\nRun /accounts to see all IDs.")
         else:
-            new_id = parts[1]
-            # Can't change env var at runtime, but store in memory for this session
-            global TOPSTEP_ACCOUNT_ID
-            TOPSTEP_ACCOUNT_ID = new_id
-            tg_send(f"✅ Active account set to <code>{new_id}</code> for this session.\n"
-                    f"To persist across deploys, set TOPSTEP_ACCOUNT_ID={new_id} in Railway env vars.")
+            new_id = parts[1].strip()
+            _save_account_id(new_id)
+            tg_send(f"✅ Active account set to <code>{new_id}</code> — saved permanently.\nSwitch anytime with /setaccount.")
 
     # ── /yes — approve pending confirmation signal ─────────────────
     elif cmd in ("/yes", "yes", "y", "take it", "take"):
@@ -604,6 +601,7 @@ def telegram_poll_loop():
         else "📋 Paper mode — simulated trades only"
     )
     confirm_str = "  |  ✋ Confirm mode ON" if CONFIRM_MODE else ""
+    _load_account_id()
     tg_send(
         "🤖 <b>Jarvis online v3.1</b>\n\n"
         f"{mode_str}{confirm_str}\n"
@@ -2414,7 +2412,35 @@ def price_heartbeat():
 TRADING_MODE       = os.environ.get("TRADING_MODE", "paper")   # "paper" | "live"
 TOPSTEP_USERNAME   = os.environ.get("TOPSTEP_USERNAME", "")
 TOPSTEP_API_KEY    = os.environ.get("TOPSTEP_API_KEY", "")
-TOPSTEP_ACCOUNT_ID = os.environ.get("TOPSTEP_ACCOUNT_ID", "")  # set via /accounts
+TOPSTEP_ACCOUNT_ID = os.environ.get("TOPSTEP_ACCOUNT_ID", "")  # fallback — overridden by Supabase
+
+def _load_account_id():
+    """Load active account ID from Supabase so /setaccount persists across restarts."""
+    global TOPSTEP_ACCOUNT_ID
+    try:
+        rows = sb_select("signals_log", extra="&notes=like.ACTIVE_ACCOUNT%25&order=id.desc&limit=1")
+        if rows:
+            stored = rows[0]["notes"].replace("ACTIVE_ACCOUNT:", "").strip()
+            if stored:
+                TOPSTEP_ACCOUNT_ID = stored
+                print(f"[TOPSTEP] Loaded account ID from DB: {stored}")
+    except:
+        pass
+
+def _save_account_id(account_id):
+    """Persist active account ID to Supabase."""
+    global TOPSTEP_ACCOUNT_ID
+    TOPSTEP_ACCOUNT_ID = account_id
+    try:
+        # Delete old entry then insert new
+        requests.delete(f"{SB_REST}/signals_log?notes=like.ACTIVE_ACCOUNT%25", headers=SB_HEADERS, timeout=5)
+        sb_insert("signals_log", {
+            "side": "CONFIG", "entry": 0, "sl": 0, "tp1": 0, "tp2": 0, "tp3": 0,
+            "contracts": 0, "session": "CONFIG", "strength": 0, "taken": False, "skipped": False,
+            "notes": f"ACTIVE_ACCOUNT:{account_id}"
+        })
+    except:
+        pass
 DAILY_LOSS_LIMIT   = float(os.environ.get("DAILY_LOSS_LIMIT", "500"))  # $500/day hard stop
 
 PROJECTX_BASE = "https://api.topstepx.com"
