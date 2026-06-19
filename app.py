@@ -468,6 +468,51 @@ def handle_tg_command(text):
     elif any(w in text for w in ["/analysis", "analysis", "analyze", "read", "market", "outlook", "what you seeing", "what do you see", "where we going", "where going"]):
         send_market_analysis()
 
+    # ── /accounts ─────────────────────────────────────────────────
+    elif cmd == "/accounts":
+        handle_accounts_command()
+
+    # ── /balance ──────────────────────────────────────────────────
+    elif cmd in ("/balance", "balance"):
+        handle_balance_command()
+
+    # ── /setaccount <id> ──────────────────────────────────────────
+    elif cmd == "/setaccount":
+        parts = original.split()
+        if len(parts) < 2:
+            tg_send("Usage: /setaccount <account_id>\nRun /accounts to see all IDs.")
+        else:
+            new_id = parts[1]
+            # Can't change env var at runtime, but store in memory for this session
+            global TOPSTEP_ACCOUNT_ID
+            TOPSTEP_ACCOUNT_ID = new_id
+            tg_send(f"✅ Active account set to <code>{new_id}</code> for this session.\n"
+                    f"To persist across deploys, set TOPSTEP_ACCOUNT_ID={new_id} in Railway env vars.")
+
+    # ── /yes — approve pending confirmation signal ─────────────────
+    elif cmd in ("/yes", "yes", "y", "take it", "take"):
+        sig = _pending_confirmation.get("signal")
+        if sig and time.time() < _pending_confirmation.get("expires", 0):
+            _pending_confirmation["signal"]  = None
+            _pending_confirmation["expires"] = 0
+            tg_send("✅ Confirmed — entering trade now.")
+            if TRADING_MODE == "live":
+                ts_enter_trade(sig)
+            else:
+                auto_enter_trade(sig)
+        else:
+            tg_send("No pending signal to approve (or it expired).")
+
+    # ── /no — reject pending confirmation signal ───────────────────
+    elif cmd in ("/no", "no", "n", "skip it", "pass"):
+        if _pending_confirmation.get("signal"):
+            _pending_confirmation["signal"]  = None
+            _pending_confirmation["expires"] = 0
+            log_signal(_pending_confirmation.get("signal") or {}, skipped=True)
+            tg_send("⏭ Signal rejected. Watching for next setup.")
+        else:
+            tg_send("No pending signal.")
+
     # ── /help ──────────────────────────────────────────────────────
     elif any(w in text for w in ["/help", "help", "?", "commands"]):
         tg_send(help_text())
@@ -526,10 +571,17 @@ def telegram_poll_loop():
     except Exception as e:
         print(f"[TG] Baseline error: {e}")
 
+    mode_str = (
+        "🟢 <b>LIVE MODE</b> — real orders on Topstep" if TRADING_MODE == "live"
+        else "📋 Paper mode — simulated trades only"
+    )
+    confirm_str = "  |  ✋ Confirm mode ON" if CONFIRM_MODE else ""
     tg_send(
-        "🤖 <b>Jarvis online v3.0</b>\n\n"
+        "🤖 <b>Jarvis online v3.1</b>\n\n"
+        f"{mode_str}{confirm_str}\n"
         f"Watching MNQM6 — {datetime.now().strftime('%H:%M EST')}\n"
         "Sessions: Overnight ✅  London ✅  NY Fridays only ✅\n"
+        "SELLs: A+++ only (NY Friday, triple TF aligned, 30pt+ strength)\n"
         "Type /help for all commands."
     )
     print("[TG] Startup message sent")
@@ -2205,6 +2257,11 @@ def background_monitor():
                     })
                     ev = get_eval_status()
                     emoji = "✅" if result == "WIN" else "❌"
+                    if TRADING_MODE == "live":
+                        # Actually close the real position on Topstep
+                        remaining_c = contracts - (c1 if tp1_h else 0) - (c2 if tp2_h else 0)
+                        if remaining_c > 0:
+                            ts_close_position(remaining_c, side)
                     tg_send(f"🔔 <b>Market close — Trade #{t['id']} {emoji}</b>\n"
                             f"{side} @ {entry}  |  Closed ${pnl:+,.2f}\n"
                             f"{'TP2 hit → closed remaining at breakeven ✅' if tp2_h else f'Price: {price}'}\n"
@@ -2222,7 +2279,10 @@ def background_monitor():
                         _last_sl["side"]  = side
                         _last_sl["time"]  = time.time()
 
-            check_open_jarvis_trades()
+            if TRADING_MODE == "live":
+                check_live_trade()
+            else:
+                check_open_jarvis_trades()
             check_eval_thresholds()
 
             # ── Signal engine — only when market is open ───────────
@@ -2238,9 +2298,22 @@ def background_monitor():
                     elif time.time() - _last_signal_time["t"] < 600:
                         print(f"[SIGNAL] Dedup — last signal was {round((time.time()-_last_signal_time['t'])/60, 1)}min ago")
                     else:
-                        log_signal(signal, taken=True)
-                        auto_enter_trade(signal)
-                        _last_signal_time["t"] = time.time()
+                        # ── Daily loss hard stop ───────────────────
+                        dl_blocked, dl_loss = check_daily_loss_limit()
+                        if dl_blocked:
+                            print(f"[SIGNAL] Daily loss limit hit (${dl_loss:,.0f}) — sitting out")
+                        elif CONFIRM_MODE:
+                            # Confirmation mode — ask user before entering
+                            log_signal(signal, taken=False)
+                            send_confirmation_request(signal)
+                            _last_signal_time["t"] = time.time()
+                        else:
+                            log_signal(signal, taken=True)
+                            if TRADING_MODE == "live":
+                                ts_enter_trade(signal)
+                            else:
+                                auto_enter_trade(signal)
+                            _last_signal_time["t"] = time.time()
                 else:
                     print(f"[SIGNAL] {msg}")
 
@@ -2294,6 +2367,571 @@ def price_heartbeat():
         except Exception as e:
             print(f"[PRICE] Heartbeat error: {e}")
         time.sleep(10)
+
+# ══════════════════════════════════════════════════════════════════
+# TOPSTEP / PROJECTX LIVE TRADING LAYER
+# ══════════════════════════════════════════════════════════════════
+#
+# TRADING_MODE controls whether Jarvis places real orders:
+#   "paper"  — current behavior: logs to Supabase only, no real orders
+#   "live"   — places real orders on Topstep via ProjectX API
+#
+# To go live: set env vars TOPSTEP_USERNAME + TOPSTEP_API_KEY + TOPSTEP_ACCOUNT_ID
+# then set TRADING_MODE=live on Railway.
+# DO NOT set TRADING_MODE=live until you have confirmed:
+#   1. Daily loss limit is configured (DAILY_LOSS_LIMIT env var, default $500)
+#   2. The account ID is correct (run /accounts command to list them)
+#   3. You're running on a personal machine — Topstep bans VPS
+#
+TRADING_MODE       = os.environ.get("TRADING_MODE", "paper")   # "paper" | "live"
+TOPSTEP_USERNAME   = os.environ.get("TOPSTEP_USERNAME", "")
+TOPSTEP_API_KEY    = os.environ.get("TOPSTEP_API_KEY", "")
+TOPSTEP_ACCOUNT_ID = os.environ.get("TOPSTEP_ACCOUNT_ID", "")  # set via /accounts
+DAILY_LOSS_LIMIT   = float(os.environ.get("DAILY_LOSS_LIMIT", "500"))  # $500/day hard stop
+
+PROJECTX_BASE = "https://api.topstepx.com"
+PROJECTX_SYMBOL = "CON.F.US.MNQM6"   # Topstep symbol for Micro NQ June 2026
+
+# ── JWT Token cache ───────────────────────────────────────────────
+_ts_token = {"jwt": None, "expires": 0}
+
+def ts_login():
+    """Authenticate with TopstepX API. JWT valid 24hrs — cached."""
+    if _ts_token["jwt"] and time.time() < _ts_token["expires"] - 300:
+        return _ts_token["jwt"]
+    if not TOPSTEP_USERNAME or not TOPSTEP_API_KEY:
+        print("[TOPSTEP] No credentials configured")
+        return None
+    try:
+        r = requests.post(
+            f"{PROJECTX_BASE}/api/Auth/loginKey",
+            json={"userName": TOPSTEP_USERNAME, "apiKey": TOPSTEP_API_KEY},
+            timeout=10
+        )
+        data = r.json()
+        token = data.get("token") or data.get("accessToken")
+        if not token:
+            print(f"[TOPSTEP] Login failed: {data}")
+            return None
+        _ts_token["jwt"]     = token
+        _ts_token["expires"] = time.time() + 86400  # 24hrs
+        print("[TOPSTEP] Authenticated ✓")
+        return token
+    except Exception as e:
+        print(f"[TOPSTEP] Login error: {e}")
+        return None
+
+def ts_headers():
+    token = ts_login()
+    if not token:
+        return None
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json"
+    }
+
+# ── Account listing ───────────────────────────────────────────────
+def ts_get_accounts():
+    """Return all funded accounts on this Topstep login."""
+    hdrs = ts_headers()
+    if not hdrs:
+        return []
+    try:
+        r = requests.get(f"{PROJECTX_BASE}/api/Account/search", headers=hdrs, timeout=10)
+        return r.json().get("accounts") or []
+    except:
+        return []
+
+def ts_get_balance(account_id=None):
+    """Fetch real live account balance from Topstep."""
+    acct = account_id or TOPSTEP_ACCOUNT_ID
+    if not acct:
+        return None
+    hdrs = ts_headers()
+    if not hdrs:
+        return None
+    try:
+        r = requests.get(
+            f"{PROJECTX_BASE}/api/Account/search",
+            headers=hdrs, timeout=10
+        )
+        accounts = r.json().get("accounts") or []
+        for a in accounts:
+            if str(a.get("id")) == str(acct) or str(a.get("accountId")) == str(acct):
+                return {
+                    "balance":      a.get("balance") or a.get("currentBalance"),
+                    "daily_pnl":    a.get("dailyPnl") or a.get("todayPnl") or 0,
+                    "open_pnl":     a.get("openPnl") or 0,
+                    "max_loss":     a.get("maxDailyLoss") or a.get("dailyLossLimit"),
+                    "profit_target":a.get("profitTarget") or a.get("targetBalance"),
+                    "status":       a.get("status") or "active",
+                }
+        return None
+    except Exception as e:
+        print(f"[TOPSTEP] Balance error: {e}")
+        return None
+
+# ── Daily loss hard stop ──────────────────────────────────────────
+def check_daily_loss_limit():
+    """
+    Pull today's realized P&L from Supabase trades.
+    Returns (is_blocked: bool, loss_today: float).
+    Live mode also checks Topstep balance for real daily P&L.
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        trades_today = sb_select("trades", extra=f"&source=eq.JARVIS&result=in.(WIN,LOSS)&trade_date=gte.{today}")
+        loss_today = sum(t.get("pnl_usd") or 0 for t in trades_today)
+        if loss_today <= -DAILY_LOSS_LIMIT:
+            return True, loss_today
+        # In live mode, also check real balance from Topstep
+        if TRADING_MODE == "live" and TOPSTEP_ACCOUNT_ID:
+            bal = ts_get_balance()
+            if bal and bal.get("daily_pnl") is not None:
+                real_daily = float(bal["daily_pnl"])
+                if real_daily <= -DAILY_LOSS_LIMIT:
+                    return True, real_daily
+    except:
+        pass
+    return False, 0
+
+# ── Open position check ───────────────────────────────────────────
+def ts_get_open_position(account_id=None):
+    """Check if there's an open position on Topstep for this account."""
+    acct = account_id or TOPSTEP_ACCOUNT_ID
+    hdrs = ts_headers()
+    if not hdrs or not acct:
+        return None
+    try:
+        r = requests.get(
+            f"{PROJECTX_BASE}/api/Position/search",
+            headers=hdrs,
+            json={"accountId": int(acct)},
+            timeout=10
+        )
+        positions = r.json().get("positions") or []
+        for p in positions:
+            if p.get("contractId") == PROJECTX_SYMBOL or "MNQ" in str(p.get("contractId","")):
+                return p
+        return None
+    except Exception as e:
+        print(f"[TOPSTEP] Position check error: {e}")
+        return None
+
+# ── Place order ───────────────────────────────────────────────────
+def ts_place_order(side, contracts, order_type="Market", price=None,
+                   stop_price=None, account_id=None, custom_tag=None):
+    """
+    Place a single order on Topstep via ProjectX.
+    Returns order_id or None.
+    side: "Buy" | "Sell"
+    order_type: "Market" | "Limit" | "Stop"
+    """
+    acct = account_id or TOPSTEP_ACCOUNT_ID
+    hdrs = ts_headers()
+    if not hdrs or not acct:
+        return None
+    payload = {
+        "accountId":  int(acct),
+        "contractId": PROJECTX_SYMBOL,
+        "action":     side,            # "Buy" or "Sell"
+        "orderType":  order_type,      # "Market", "Limit", "Stop"
+        "size":       contracts,
+        "timeInForce":"GTC",
+    }
+    if price:       payload["price"]     = price
+    if stop_price:  payload["stopPrice"] = stop_price
+    if custom_tag:  payload["customTag"] = str(custom_tag)
+
+    try:
+        r = requests.post(
+            f"{PROJECTX_BASE}/api/Order/place",
+            headers=hdrs, json=payload, timeout=10
+        )
+        data = r.json()
+        order_id = data.get("orderId") or data.get("id")
+        if not order_id:
+            print(f"[TOPSTEP] Place order failed: {data}")
+        return order_id
+    except Exception as e:
+        print(f"[TOPSTEP] Place order error: {e}")
+        return None
+
+def ts_cancel_order(order_id, account_id=None):
+    """Cancel an open order."""
+    acct = account_id or TOPSTEP_ACCOUNT_ID
+    hdrs = ts_headers()
+    if not hdrs:
+        return False
+    try:
+        r = requests.post(
+            f"{PROJECTX_BASE}/api/Order/cancel",
+            headers=hdrs,
+            json={"accountId": int(acct), "orderId": order_id},
+            timeout=10
+        )
+        return r.status_code == 200
+    except:
+        return False
+
+def ts_close_position(contracts, side, account_id=None):
+    """Market-close N contracts. side = current position side (close is opposite)."""
+    close_side = "Sell" if side == "BUY" else "Buy"
+    return ts_place_order(close_side, contracts, "Market", account_id=account_id)
+
+# ── Enter trade — live version ─────────────────────────────────────
+def ts_enter_trade(signal):
+    """
+    Full entry sequence for live Topstep trading:
+    1. Safety checks (daily loss, existing position, account health)
+    2. Market entry order
+    3. Hard stop-loss order (StopMarket)
+    4. Log to Supabase, alert Telegram with real order IDs
+    Scale-out (TP1→close c1, TP2→close c2, TP3→close c3) is handled
+    by check_live_trade() which polls position and price.
+    """
+    if TRADING_MODE != "live":
+        return None  # paper mode — use auto_enter_trade() instead
+
+    # ── Safety gate 1: daily loss limit ───────────────────────────
+    blocked, loss_today = check_daily_loss_limit()
+    if blocked:
+        msg = (f"🛑 <b>DAILY LOSS LIMIT HIT — TRADING HALTED</b>\n\n"
+               f"Today's P&L: <b>−${abs(loss_today):,.2f}</b>  (limit: −${DAILY_LOSS_LIMIT:,.0f})\n"
+               f"Jarvis is done for today. Reset at midnight UTC.")
+        tg_send(msg)
+        print(f"[LIVE] Daily loss limit ${DAILY_LOSS_LIMIT} hit. Blocking entry.")
+        return None
+
+    # ── Safety gate 2: no existing open position ───────────────────
+    existing = ts_get_open_position()
+    if existing:
+        print(f"[LIVE] Already have open position — skipping entry")
+        return None
+
+    # ── Safety gate 3: account health ─────────────────────────────
+    bal = ts_get_balance()
+    if not bal:
+        tg_send("⚠️ <b>Can't read Topstep balance</b> — skipping entry to be safe.")
+        return None
+    acct_balance = float(bal.get("balance") or 0)
+    # Don't trade if we're within $200 of the floor
+    if acct_balance < (EVAL_FLOOR + 200):
+        tg_send(f"🛑 <b>Account too close to floor</b> — ${acct_balance:,.2f}. "
+                f"Stopping to protect the account.")
+        return None
+
+    side       = signal["side"]
+    contracts  = signal["contracts"]
+    entry      = signal["entry"]
+    sl         = signal["sl"]
+    c1, c2, c3 = get_scale(contracts)
+    ts_side    = "Buy" if side == "BUY" else "Sell"
+    ts_sl_side = "Sell" if side == "BUY" else "Buy"
+
+    print(f"[LIVE] Placing {ts_side} {contracts}MNQ — entry market, SL @ {sl}")
+
+    # ── Step 1: Market entry ───────────────────────────────────────
+    entry_order_id = ts_place_order(ts_side, contracts, "Market")
+    if not entry_order_id:
+        tg_send("⚠️ <b>Entry order FAILED</b> — check Topstep account manually.")
+        return None
+    time.sleep(1)  # brief wait for fill
+
+    # ── Step 2: Hard stop-loss (full size, stop-market) ───────────
+    sl_order_id = ts_place_order(
+        ts_sl_side, contracts, "Stop",
+        stop_price=sl
+    )
+    if not sl_order_id:
+        # Entry is live but SL failed — emergency close
+        ts_close_position(contracts, side)
+        tg_send("🚨 <b>SL ORDER FAILED — emergency closed position.</b> Check account.")
+        return None
+
+    # ── Log to Supabase ───────────────────────────────────────────
+    bio = build_entry_bio(signal)
+    trade_row = {
+        "trade_date":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "side":          side,
+        "entry":         entry,
+        "sl":            sl,
+        "tp1":           signal["tp1"],
+        "tp2":           signal["tp2"],
+        "tp3":           signal["tp3"],
+        "contracts":     contracts,
+        "trader":        "JARVIS",
+        "source":        "JARVIS",
+        "result":        "OPEN",
+        "notes":         bio + f" | entry_order:{entry_order_id} sl_order:{sl_order_id}",
+    }
+    logged = sb_insert("trades", trade_row)
+    trade_id = logged["id"] if logged else "?"
+
+    # ── Telegram alert ────────────────────────────────────────────
+    risk_usd = round(40 * PTS_TO_USD * contracts)
+    tp1_usd  = round(34 * PTS_TO_USD * c1)
+    tp2_usd  = round(65 * PTS_TO_USD * c2)
+    tp3_usd  = round(100 * PTS_TO_USD * c3)
+    tg_send(
+        f"{'🟢' if side=='BUY' else '🔴'} <b>LIVE ORDER PLACED — #{trade_id}</b>\n\n"
+        f"<b>{side} {contracts} MNQ</b>  (real money 💰)\n"
+        f"Entry: Market  |  SL: <code>{sl}</code>\n"
+        f"TP1 {c1}c @ <code>{signal['tp1']}</code>  +${tp1_usd}\n"
+        f"TP2 {c2}c @ <code>{signal['tp2']}</code>  +${tp2_usd}  ← SL→BE\n"
+        f"TP3 {c3}c @ <code>{signal['tp3']}</code>  +${tp3_usd}\n"
+        f"Risk: −${risk_usd}  |  Max: +${tp1_usd+tp2_usd+tp3_usd}\n\n"
+        f"🏦 Balance: ${acct_balance:,.2f}  |  entry#{entry_order_id}  sl#{sl_order_id}"
+    )
+
+    # Store order IDs in memory for check_live_trade to use
+    _live_trade_state["trade_id"]       = trade_id
+    _live_trade_state["sl_order_id"]    = sl_order_id
+    _live_trade_state["contracts"]      = contracts
+    _live_trade_state["c1"]             = c1
+    _live_trade_state["c2"]             = c2
+    _live_trade_state["c3"]             = c3
+    _live_trade_state["side"]           = side
+    _live_trade_state["entry"]          = entry
+    _live_trade_state["sl"]             = sl
+    _live_trade_state["tp1"]            = signal["tp1"]
+    _live_trade_state["tp2"]            = signal["tp2"]
+    _live_trade_state["tp3"]            = signal["tp3"]
+    _live_trade_state["tp1_hit"]        = False
+    _live_trade_state["tp2_hit"]        = False
+    return trade_id
+
+# ── Live trade monitor state ──────────────────────────────────────
+_live_trade_state = {
+    "trade_id": None, "sl_order_id": None, "contracts": 0,
+    "c1": 0, "c2": 0, "c3": 0, "side": None,
+    "entry": 0, "sl": 0, "tp1": 0, "tp2": 0, "tp3": 0,
+    "tp1_hit": False, "tp2_hit": False
+}
+
+def check_live_trade():
+    """
+    Called every 10s when TRADING_MODE=live.
+    Monitors price vs TP levels — places partial close orders at each TP.
+    Handles: TP1 close c1 → TP2 close c2 + cancel SL + place SL at BE → TP3 close c3.
+    Falls back to Supabase update + Telegram just like paper mode.
+    """
+    if TRADING_MODE != "live":
+        return
+    s = _live_trade_state
+    if not s["trade_id"] or not s["side"]:
+        return
+
+    price = get_live_price()
+    if not price:
+        return
+
+    side  = s["side"]
+    entry = s["entry"]
+    sl    = s["sl"]
+    tp1   = s["tp1"]
+    tp2   = s["tp2"]
+    tp3   = s["tp3"]
+    c1, c2, c3 = s["c1"], s["c2"], s["c3"]
+    close_side = "Sell" if side == "BUY" else "Buy"
+
+    hit_tp1 = (side=="BUY" and price >= tp1) or (side=="SELL" and price <= tp1)
+    hit_tp2 = (side=="BUY" and price >= tp2) or (side=="SELL" and price <= tp2)
+    hit_tp3 = (side=="BUY" and price >= tp3) or (side=="SELL" and price <= tp3)
+    hit_sl  = (side=="BUY" and price <= sl)  or (side=="SELL" and price >= sl)
+
+    # ── TP1 ──────────────────────────────────────────────────────
+    if hit_tp1 and not s["tp1_hit"] and not hit_tp2:
+        print(f"[LIVE] TP1 hit @ {price} — closing {c1} contracts")
+        oid = ts_place_order(close_side, c1, "Market")
+        if oid:
+            s["tp1_hit"] = True
+            sb_update("trades", s["trade_id"], {"tp1_hit": True})
+            tg_send(f"✅ <b>TP1 hit</b> — closed {c1}MNQ @ <code>{tp1}</code>  +${round(34*PTS_TO_USD*c1)}")
+
+    # ── TP2 — close c2 + cancel old SL + place new SL at entry (BE) ──
+    if hit_tp2 and not s["tp2_hit"]:
+        print(f"[LIVE] TP2 hit @ {price} — closing {c2} contracts, moving SL to BE")
+        oid = ts_place_order(close_side, c2, "Market")
+        if oid:
+            # Cancel original SL order
+            if s["sl_order_id"]:
+                ts_cancel_order(s["sl_order_id"])
+            # Place new SL at breakeven (for remaining c3 contracts)
+            be_sl_id = ts_place_order(
+                close_side, c3, "Stop", stop_price=entry
+            )
+            s["tp1_hit"] = True
+            s["tp2_hit"] = True
+            s["sl_order_id"] = be_sl_id
+            s["sl"] = entry
+            sb_update("trades", s["trade_id"], {
+                "tp1_hit": True, "tp2_hit": True, "sl": entry
+            })
+            tg_send(
+                f"⚡ <b>TP2 hit — SL at Breakeven</b>\n"
+                f"Closed {c2}MNQ @ <code>{tp2}</code>  +${round(65*PTS_TO_USD*c2)}\n"
+                f"SL → entry <code>{entry}</code>  |  {c3}MNQ targeting TP3 <code>{tp3}</code>"
+            )
+
+    # ── TP3 — close final c3 contracts ────────────────────────────
+    if hit_tp3:
+        print(f"[LIVE] TP3 hit @ {price} — closing final {c3} contracts")
+        oid = ts_place_order(close_side, c3, "Market")
+        if s["sl_order_id"]:
+            ts_cancel_order(s["sl_order_id"])
+        pnl = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, s["contracts"],
+                               True, True, True, False)
+        _resolve_live_trade("WIN", True, True, True, False, pnl)
+        return
+
+    # ── SL hit ────────────────────────────────────────────────────
+    if hit_sl and not hit_tp3:
+        # Position was closed by the SL order on Topstep's side
+        # Just resolve the Supabase record
+        tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
+        if tp2h:
+            result = "WIN"  # SL was at BE, so we're guaranteed +
+        elif tp1h:
+            result = "WIN"  # TP1 profit - remaining loss = still positive
+        else:
+            result = "LOSS"
+        pnl = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, s["contracts"],
+                               tp1h, tp2h, False, True)
+        _resolve_live_trade(result, tp1h, tp2h, False, True, pnl)
+
+def _resolve_live_trade(result, tp1h, tp2h, tp3h, slh, pnl_usd):
+    """Write final result to Supabase and send Telegram close message."""
+    s = _live_trade_state
+    if not s["trade_id"]:
+        return
+
+    pts = abs(s["tp3"] - s["entry"]) if tp3h else (
+          abs(s["tp2"] - s["entry"]) if tp2h else (
+          abs(s["tp1"] - s["entry"]) if tp1h else
+          abs(s["sl"]  - s["entry"])))
+
+    sb_update("trades", s["trade_id"], {
+        "result":   result,
+        "tp1_hit":  bool(tp1h),
+        "tp2_hit":  bool(tp2h),
+        "tp3_hit":  bool(tp3h),
+        "sl_hit":   bool(slh),
+        "pnl_usd":  pnl_usd,
+        "pnl_pts":  round(pts, 2),
+        "closed_at": datetime.now().isoformat()
+    })
+
+    # Set cooldown
+    if result == "WIN":
+        _cooldown["until"]  = time.time() + 1800
+        _cooldown["reason"] = "WIN — 30min cooldown"
+    else:
+        _cooldown["until"]  = time.time() + 3600
+        _cooldown["reason"] = "LOSS — 60min cooldown"
+        _last_sl["price"] = s["sl"]
+        _last_sl["side"]  = s["side"]
+        _last_sl["time"]  = time.time()
+
+    ev = get_eval_status()
+    emoji = "✅" if result == "WIN" else "❌"
+    tps = " → ".join([x for x, h in [("TP1", tp1h), ("TP2", tp2h), ("TP3", tp3h)] if h])
+    tg_send(
+        f"{emoji} <b>LIVE CLOSE — #{s['trade_id']}</b>  ({result})\n\n"
+        f"{s['side']} {s['contracts']}MNQ  |  {tps or 'SL'}\n"
+        f"P&L: <b>{'+'if pnl_usd>=0 else ''}${pnl_usd:,.2f}</b>\n\n"
+        f"🏦 Topstep balance: ${ev['eval_balance']:,.2f}"
+    )
+
+    # Clear live state
+    for k in _live_trade_state:
+        _live_trade_state[k] = None if k in ("trade_id","sl_order_id","side") else (
+                               False if k in ("tp1_hit","tp2_hit") else 0)
+
+# ── Confirmation mode — Telegram approve before entry ────────────
+# CONFIRM_MODE=true → Jarvis sends signal to Telegram, waits for /yes or /no
+# CONFIRM_MODE=false (default) → fully autonomous, enters immediately
+CONFIRM_MODE = os.environ.get("CONFIRM_MODE", "false").lower() == "true"
+_pending_confirmation = {"signal": None, "expires": 0}
+
+def send_confirmation_request(signal):
+    """Send pending signal to Telegram, wait for /yes or /no (5min timeout)."""
+    _pending_confirmation["signal"]  = signal
+    _pending_confirmation["expires"] = time.time() + 300  # 5min to decide
+
+    side  = signal["side"]
+    c     = signal["contracts"]
+    entry = signal["entry"]
+    sl    = signal["sl"]
+    tp3   = signal["tp3"]
+    c1,c2,c3 = get_scale(c)
+    risk  = round(40 * PTS_TO_USD * c)
+    maxx  = round((34*PTS_TO_USD*c1) + (65*PTS_TO_USD*c2) + (100*PTS_TO_USD*c3))
+    side_emoji = "🟢" if side=="BUY" else "🔴"
+
+    tg_send(
+        f"{side_emoji} <b>SIGNAL — WAITING FOR APPROVAL</b>\n\n"
+        f"<b>{side} {c} MNQ</b> @ market (~<code>{entry}</code>)\n"
+        f"SL: <code>{sl}</code>  |  TP3: <code>{tp3}</code>\n"
+        f"Risk: −${risk}  |  Max: +${maxx}\n\n"
+        f"Reply <b>/yes</b> to take  |  <b>/no</b> to skip\n"
+        f"<i>Auto-expires in 5 minutes</i>"
+    )
+
+# ── /accounts command ─────────────────────────────────────────────
+def handle_accounts_command():
+    if not TOPSTEP_USERNAME:
+        tg_send("⚠️ TOPSTEP_USERNAME not set. Add it to Railway env vars.")
+        return
+    accounts = ts_get_accounts()
+    if not accounts:
+        tg_send("No accounts found — check credentials.")
+        return
+    lines = ["<b>Topstep Accounts:</b>\n"]
+    for a in accounts:
+        acct_id   = a.get("id") or a.get("accountId")
+        name      = a.get("name") or a.get("accountName") or "?"
+        bal       = a.get("balance") or a.get("currentBalance") or 0
+        status    = a.get("status") or "?"
+        is_active = "← ACTIVE" if str(acct_id) == str(TOPSTEP_ACCOUNT_ID) else ""
+        lines.append(f"  <code>{acct_id}</code>  {name}  ${float(bal):,.2f}  [{status}] {is_active}")
+    lines.append(f"\nSet active: /setaccount &lt;id&gt;")
+    lines.append(f"Mode: <b>{TRADING_MODE.upper()}</b>  |  Daily loss limit: −${DAILY_LOSS_LIMIT:,.0f}")
+    tg_send("\n".join(lines))
+
+# ── /balance command ──────────────────────────────────────────────
+def handle_balance_command():
+    if TRADING_MODE == "paper":
+        ev = get_eval_status()
+        tg_send(
+            f"📊 <b>Balance (Paper Mode)</b>\n\n"
+            f"Simulated eval: <b>${ev['eval_balance']:,.2f}</b>\n"
+            f"To target: ${ev['to_target']:,.0f}  |  DD buffer: ${ev['to_floor']:,.0f}\n\n"
+            f"<i>TRADING_MODE=paper — no real money involved</i>"
+        )
+        return
+    bal = ts_get_balance()
+    if not bal:
+        tg_send("⚠️ Couldn't fetch Topstep balance — check credentials.")
+        return
+    daily = float(bal.get("daily_pnl") or 0)
+    open_pnl = float(bal.get("open_pnl") or 0)
+    balance  = float(bal.get("balance") or 0)
+    tg_send(
+        f"🏦 <b>Topstep Balance (LIVE)</b>\n\n"
+        f"Balance: <b>${balance:,.2f}</b>\n"
+        f"Today's P&L: {'+'if daily>=0 else ''}${daily:,.2f}\n"
+        f"Open P&L: {'+'if open_pnl>=0 else ''}${open_pnl:,.2f}\n"
+        f"Daily loss limit: −${DAILY_LOSS_LIMIT:,.0f}  "
+        f"({'⛔ BLOCKED' if daily <= -DAILY_LOSS_LIMIT else '✅ OK'})"
+    )
+
+# ── Wire /yes /no /accounts /balance /setaccount into commands ───
+COMMANDS.setdefault("⚙️ Admin", []).extend([
+    ("/accounts", "List all Topstep funded accounts + balances"),
+    ("/balance",  "Live Topstep balance, today's P&L, daily limit status"),
+    ("/setaccount","Switch active account: /setaccount <id>"),
+])
 
 def _start_threads():
     threading.Thread(target=start_ws,           daemon=True).start()
