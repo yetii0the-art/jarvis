@@ -2471,18 +2471,18 @@ def ts_get_balance(account_id=None):
         accounts = data if isinstance(data, list) else (data.get("accounts") or data.get("data") or [])
         # If no account ID specified, return first active account
         for a in accounts:
-            aid = str(a.get("id") or a.get("accountId") or "")
+            aid = str(a.get("id") or "")
             if not acct or aid == str(acct):
                 return {
                     "id":           aid,
-                    "name":         a.get("name") or a.get("accountName") or "?",
-                    "balance":      a.get("balance") or a.get("currentBalance") or 0,
-                    "daily_pnl":    a.get("dailyPnl") or a.get("todayPnl") or 0,
+                    "name":         a.get("name") or "?",
+                    "balance":      a.get("balance") or 0,
+                    "daily_pnl":    a.get("dailyPnl") or 0,
                     "open_pnl":     a.get("openPnl") or 0,
                     "max_loss":     a.get("maxDailyLoss") or a.get("dailyLossLimit"),
-                    "profit_target":a.get("profitTarget") or a.get("targetBalance"),
-                    "status":       a.get("status") or "active",
-                    "can_trade":    a.get("canTrade") if a.get("canTrade") is not None else True,
+                    "profit_target":a.get("profitTarget"),
+                    "status":       "sim" if a.get("simulated") else "live",
+                    "can_trade":    a.get("canTrade", True),
                 }
         return None
     except Exception as e:
@@ -2521,8 +2521,9 @@ def ts_get_open_position(account_id=None):
     if not hdrs or not acct:
         return None
     try:
+        # Correct endpoint: /api/Position/searchOpen
         r = requests.post(
-            f"{PROJECTX_BASE}/api/Position/search",
+            f"{PROJECTX_BASE}/api/Position/searchOpen",
             headers=hdrs,
             json={"accountId": int(acct)},
             timeout=10
@@ -2530,7 +2531,8 @@ def ts_get_open_position(account_id=None):
         data = r.json()
         positions = data if isinstance(data, list) else (data.get("positions") or data.get("data") or [])
         for p in positions:
-            if p.get("contractId") == PROJECTX_SYMBOL or "MNQ" in str(p.get("contractId","")):
+            cid = str(p.get("contractId") or "")
+            if PROJECTX_SYMBOL in cid or "MNQ" in cid:
                 return p
         return None
     except Exception as e:
@@ -2538,6 +2540,11 @@ def ts_get_open_position(account_id=None):
         return None
 
 # ── Place order ───────────────────────────────────────────────────
+# Swagger-confirmed field names:
+#   side: 0=Buy, 1=Sell  |  type: 1=Market, 2=Limit, 3=Stop, 4=StopLimit
+ORDER_SIDE = {"Buy": 0, "Sell": 1}
+ORDER_TYPE = {"Market": 1, "Limit": 2, "Stop": 3, "StopLimit": 4}
+
 def ts_place_order(side, contracts, order_type="Market", price=None,
                    stop_price=None, account_id=None, custom_tag=None):
     """
@@ -2553,14 +2560,13 @@ def ts_place_order(side, contracts, order_type="Market", price=None,
     payload = {
         "accountId":  int(acct),
         "contractId": PROJECTX_SYMBOL,
-        "action":     side,            # "Buy" or "Sell"
-        "orderType":  order_type,      # "Market", "Limit", "Stop"
+        "side":       ORDER_SIDE.get(side, 0),
+        "type":       ORDER_TYPE.get(order_type, 1),
         "size":       contracts,
-        "timeInForce":"GTC",
     }
-    if price:       payload["price"]     = price
-    if stop_price:  payload["stopPrice"] = stop_price
-    if custom_tag:  payload["customTag"] = str(custom_tag)
+    if price:       payload["limitPrice"] = price
+    if stop_price:  payload["stopPrice"]  = stop_price
+    if custom_tag:  payload["customTag"]  = str(custom_tag)
 
     try:
         r = requests.post(
@@ -2568,6 +2574,7 @@ def ts_place_order(side, contracts, order_type="Market", price=None,
             headers=hdrs, json=payload, timeout=10
         )
         data = r.json()
+        print(f"[TOPSTEP] Place order response: {str(data)[:200]}")
         order_id = data.get("orderId") or data.get("id")
         if not order_id:
             print(f"[TOPSTEP] Place order failed: {data}")
@@ -2589,14 +2596,26 @@ def ts_cancel_order(order_id, account_id=None):
             json={"accountId": int(acct), "orderId": order_id},
             timeout=10
         )
-        return r.status_code == 200
+        return r.json().get("success", False)
     except:
         return False
 
 def ts_close_position(contracts, side, account_id=None):
-    """Market-close N contracts. side = current position side (close is opposite)."""
-    close_side = "Sell" if side == "BUY" else "Buy"
-    return ts_place_order(close_side, contracts, "Market", account_id=account_id)
+    """Partial close N contracts using the dedicated endpoint."""
+    acct = account_id or TOPSTEP_ACCOUNT_ID
+    hdrs = ts_headers()
+    if not hdrs or not acct:
+        return False
+    try:
+        r = requests.post(
+            f"{PROJECTX_BASE}/api/Position/partialCloseContract",
+            headers=hdrs,
+            json={"accountId": int(acct), "contractId": PROJECTX_SYMBOL, "size": contracts},
+            timeout=10
+        )
+        return r.json().get("success", False)
+    except:
+        return False
 
 # ── Enter trade — live version ─────────────────────────────────────
 def ts_enter_trade(signal):
@@ -2908,14 +2927,16 @@ def handle_accounts_command():
         return
     lines = [f"<b>Topstep Accounts ({len(accounts)})</b>\n"]
     for a in accounts:
-        acct_id  = str(a.get("id") or a.get("accountId") or "?")
-        name     = a.get("name") or a.get("accountName") or "?"
-        bal      = float(a.get("balance") or a.get("currentBalance") or 0)
-        daily    = float(a.get("dailyPnl") or a.get("todayPnl") or 0)
-        status   = a.get("status") or "?"
+        acct_id  = str(a.get("id") or "?")
+        name     = a.get("name") or "?"
+        bal      = float(a.get("balance") or 0)
+        daily    = float(a.get("dailyPnl") or 0)
+        sim_tag  = " [SIM]" if a.get("simulated") else ""
+        can_trade = a.get("canTrade", True)
         active   = "  ◀ TRADING" if acct_id == str(TOPSTEP_ACCOUNT_ID) else ""
+        flag     = "🟢" if can_trade else "🔴"
         daily_str = f"  today {'+'if daily>=0 else ''}${daily:,.0f}"
-        lines.append(f"<code>{acct_id}</code>  {name}\n  ${bal:,.2f}{daily_str}  [{status}]{active}\n")
+        lines.append(f"{flag} <code>{acct_id}</code>  {name}{sim_tag}\n  ${bal:,.2f}{daily_str}{active}\n")
     lines.append(f"Active: /setaccount &lt;id&gt;")
     lines.append(f"Mode: <b>{TRADING_MODE.upper()}</b>  |  Daily stop: −${DAILY_LOSS_LIMIT:,.0f}")
     tg_send("\n".join(lines))
@@ -2929,19 +2950,19 @@ def handle_balance_command():
     lines = [f"🏦 <b>All Topstep Accounts</b>\n"]
     total_bal = 0
     for a in accounts:
-        acct_id  = str(a.get("id") or a.get("accountId") or "?")
-        name     = a.get("name") or a.get("accountName") or "?"
-        bal      = float(a.get("balance") or a.get("currentBalance") or 0)
-        daily    = float(a.get("dailyPnl") or a.get("todayPnl") or 0)
-        open_pnl = float(a.get("openPnl") or 0)
-        status   = a.get("status") or "active"
+        acct_id   = str(a.get("id") or "?")
+        name      = a.get("name") or "?"
+        bal       = float(a.get("balance") or 0)
+        daily     = float(a.get("dailyPnl") or 0)
+        open_pnl  = float(a.get("openPnl") or 0)
         can_trade = a.get("canTrade", True)
-        trading_flag = "🟢" if can_trade else "🔴"
-        active   = "  ◀ ACTIVE" if acct_id == str(TOPSTEP_ACCOUNT_ID) else ""
+        sim_tag   = " [SIM]" if a.get("simulated") else ""
+        flag      = "🟢" if can_trade else "🔴"
+        active    = "  ◀ ACTIVE" if acct_id == str(TOPSTEP_ACCOUNT_ID) else ""
         total_bal += bal
         dl_ok = daily > -DAILY_LOSS_LIMIT
         lines.append(
-            f"{trading_flag} <b>{name}</b>{active}\n"
+            f"{flag} <b>{name}{sim_tag}</b>{active}\n"
             f"  Balance: <b>${bal:,.2f}</b>\n"
             f"  Today: {'+'if daily>=0 else ''}${daily:,.2f}  {'✅' if dl_ok else '⛔ LIMIT HIT'}\n"
             + (f"  Open P&L: {'+'if open_pnl>=0 else ''}${open_pnl:,.2f}\n" if open_pnl else "")
