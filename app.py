@@ -468,6 +468,34 @@ def handle_tg_command(text):
     elif any(w in text for w in ["/analysis", "analysis", "analyze", "read", "market", "outlook", "what you seeing", "what do you see", "where we going", "where going"]):
         send_market_analysis()
 
+    # ── /tstest — raw auth + account debug ────────────────────────
+    elif cmd == "/tstest":
+        tg_send(f"Testing ProjectX auth...\nUsername: <code>{TOPSTEP_USERNAME}</code>\nKey: <code>...{TOPSTEP_API_KEY[-6:] if TOPSTEP_API_KEY else 'NOT SET'}</code>")
+        # Force fresh login, bypass cache
+        _ts_token["jwt"] = None
+        _ts_token["expires"] = 0
+        try:
+            r = requests.post(
+                f"{PROJECTX_BASE}/api/Auth/loginKey",
+                headers={"Content-Type": "application/json", "accept": "text/plain"},
+                json={"userName": TOPSTEP_USERNAME, "apiKey": TOPSTEP_API_KEY},
+                timeout=10
+            )
+            tg_send(f"Auth response ({r.status_code}):\n<code>{r.text[:500]}</code>")
+            if r.status_code == 200:
+                data = r.json()
+                token = data.get("token") or data.get("accessToken")
+                if token:
+                    _ts_token["jwt"] = token
+                    _ts_token["expires"] = time.time() + 86400
+                    # Try account search
+                    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                    r2 = requests.post(f"{PROJECTX_BASE}/api/Account/search",
+                                       headers=hdrs, json={"onlyActiveAccounts": False}, timeout=10)
+                    tg_send(f"Account search ({r2.status_code}):\n<code>{r2.text[:500]}</code>")
+        except Exception as e:
+            tg_send(f"Error: {e}")
+
     # ── /accounts ─────────────────────────────────────────────────
     elif cmd == "/accounts":
         handle_accounts_command()
@@ -2405,9 +2433,11 @@ def ts_login():
     try:
         r = requests.post(
             f"{PROJECTX_BASE}/api/Auth/loginKey",
+            headers={"Content-Type": "application/json", "accept": "text/plain"},
             json={"userName": TOPSTEP_USERNAME, "apiKey": TOPSTEP_API_KEY},
             timeout=10
         )
+        print(f"[TOPSTEP] Auth status={r.status_code} body={r.text[:300]}")
         data = r.json()
         token = data.get("token") or data.get("accessToken")
         if not token:
