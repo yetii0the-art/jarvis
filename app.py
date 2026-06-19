@@ -2432,39 +2432,57 @@ def ts_headers():
 
 # ── Account listing ───────────────────────────────────────────────
 def ts_get_accounts():
-    """Return all funded accounts on this Topstep login."""
+    """Return all accounts on this Topstep login."""
     hdrs = ts_headers()
     if not hdrs:
         return []
     try:
-        r = requests.get(f"{PROJECTX_BASE}/api/Account/search", headers=hdrs, timeout=10)
-        return r.json().get("accounts") or []
-    except:
+        # ProjectX uses POST for search endpoints
+        r = requests.post(
+            f"{PROJECTX_BASE}/api/Account/search",
+            headers=hdrs,
+            json={"onlyActiveAccounts": False},
+            timeout=10
+        )
+        data = r.json()
+        print(f"[TOPSTEP] Account search raw: {str(data)[:300]}")
+        # Response may be list directly or wrapped in "accounts"
+        if isinstance(data, list):
+            return data
+        return data.get("accounts") or data.get("data") or []
+    except Exception as e:
+        print(f"[TOPSTEP] Account search error: {e}")
         return []
 
 def ts_get_balance(account_id=None):
     """Fetch real live account balance from Topstep."""
     acct = account_id or TOPSTEP_ACCOUNT_ID
-    if not acct:
-        return None
     hdrs = ts_headers()
     if not hdrs:
         return None
     try:
-        r = requests.get(
+        r = requests.post(
             f"{PROJECTX_BASE}/api/Account/search",
-            headers=hdrs, timeout=10
+            headers=hdrs,
+            json={"onlyActiveAccounts": False},
+            timeout=10
         )
-        accounts = r.json().get("accounts") or []
+        data = r.json()
+        accounts = data if isinstance(data, list) else (data.get("accounts") or data.get("data") or [])
+        # If no account ID specified, return first active account
         for a in accounts:
-            if str(a.get("id")) == str(acct) or str(a.get("accountId")) == str(acct):
+            aid = str(a.get("id") or a.get("accountId") or "")
+            if not acct or aid == str(acct):
                 return {
-                    "balance":      a.get("balance") or a.get("currentBalance"),
+                    "id":           aid,
+                    "name":         a.get("name") or a.get("accountName") or "?",
+                    "balance":      a.get("balance") or a.get("currentBalance") or 0,
                     "daily_pnl":    a.get("dailyPnl") or a.get("todayPnl") or 0,
                     "open_pnl":     a.get("openPnl") or 0,
                     "max_loss":     a.get("maxDailyLoss") or a.get("dailyLossLimit"),
                     "profit_target":a.get("profitTarget") or a.get("targetBalance"),
                     "status":       a.get("status") or "active",
+                    "can_trade":    a.get("canTrade") if a.get("canTrade") is not None else True,
                 }
         return None
     except Exception as e:
@@ -2503,13 +2521,14 @@ def ts_get_open_position(account_id=None):
     if not hdrs or not acct:
         return None
     try:
-        r = requests.get(
+        r = requests.post(
             f"{PROJECTX_BASE}/api/Position/search",
             headers=hdrs,
             json={"accountId": int(acct)},
             timeout=10
         )
-        positions = r.json().get("positions") or []
+        data = r.json()
+        positions = data if isinstance(data, list) else (data.get("positions") or data.get("data") or [])
         for p in positions:
             if p.get("contractId") == PROJECTX_SYMBOL or "MNQ" in str(p.get("contractId","")):
                 return p
@@ -2885,46 +2904,51 @@ def handle_accounts_command():
         return
     accounts = ts_get_accounts()
     if not accounts:
-        tg_send("No accounts found — check credentials.")
+        tg_send("No accounts found — check credentials.\nMake sure TOPSTEP_USERNAME matches your ProjectX dashboard username exactly.")
         return
-    lines = ["<b>Topstep Accounts:</b>\n"]
+    lines = [f"<b>Topstep Accounts ({len(accounts)})</b>\n"]
     for a in accounts:
-        acct_id   = a.get("id") or a.get("accountId")
-        name      = a.get("name") or a.get("accountName") or "?"
-        bal       = a.get("balance") or a.get("currentBalance") or 0
-        status    = a.get("status") or "?"
-        is_active = "← ACTIVE" if str(acct_id) == str(TOPSTEP_ACCOUNT_ID) else ""
-        lines.append(f"  <code>{acct_id}</code>  {name}  ${float(bal):,.2f}  [{status}] {is_active}")
-    lines.append(f"\nSet active: /setaccount &lt;id&gt;")
-    lines.append(f"Mode: <b>{TRADING_MODE.upper()}</b>  |  Daily loss limit: −${DAILY_LOSS_LIMIT:,.0f}")
+        acct_id  = str(a.get("id") or a.get("accountId") or "?")
+        name     = a.get("name") or a.get("accountName") or "?"
+        bal      = float(a.get("balance") or a.get("currentBalance") or 0)
+        daily    = float(a.get("dailyPnl") or a.get("todayPnl") or 0)
+        status   = a.get("status") or "?"
+        active   = "  ◀ TRADING" if acct_id == str(TOPSTEP_ACCOUNT_ID) else ""
+        daily_str = f"  today {'+'if daily>=0 else ''}${daily:,.0f}"
+        lines.append(f"<code>{acct_id}</code>  {name}\n  ${bal:,.2f}{daily_str}  [{status}]{active}\n")
+    lines.append(f"Active: /setaccount &lt;id&gt;")
+    lines.append(f"Mode: <b>{TRADING_MODE.upper()}</b>  |  Daily stop: −${DAILY_LOSS_LIMIT:,.0f}")
     tg_send("\n".join(lines))
 
 # ── /balance command ──────────────────────────────────────────────
 def handle_balance_command():
-    if TRADING_MODE == "paper":
-        ev = get_eval_status()
-        tg_send(
-            f"📊 <b>Balance (Paper Mode)</b>\n\n"
-            f"Simulated eval: <b>${ev['eval_balance']:,.2f}</b>\n"
-            f"To target: ${ev['to_target']:,.0f}  |  DD buffer: ${ev['to_floor']:,.0f}\n\n"
-            f"<i>TRADING_MODE=paper — no real money involved</i>"
+    accounts = ts_get_accounts()
+    if not accounts:
+        tg_send("⚠️ Can't reach Topstep — check TOPSTEP_USERNAME and TOPSTEP_API_KEY.")
+        return
+    lines = [f"🏦 <b>All Topstep Accounts</b>\n"]
+    total_bal = 0
+    for a in accounts:
+        acct_id  = str(a.get("id") or a.get("accountId") or "?")
+        name     = a.get("name") or a.get("accountName") or "?"
+        bal      = float(a.get("balance") or a.get("currentBalance") or 0)
+        daily    = float(a.get("dailyPnl") or a.get("todayPnl") or 0)
+        open_pnl = float(a.get("openPnl") or 0)
+        status   = a.get("status") or "active"
+        can_trade = a.get("canTrade", True)
+        trading_flag = "🟢" if can_trade else "🔴"
+        active   = "  ◀ ACTIVE" if acct_id == str(TOPSTEP_ACCOUNT_ID) else ""
+        total_bal += bal
+        dl_ok = daily > -DAILY_LOSS_LIMIT
+        lines.append(
+            f"{trading_flag} <b>{name}</b>{active}\n"
+            f"  Balance: <b>${bal:,.2f}</b>\n"
+            f"  Today: {'+'if daily>=0 else ''}${daily:,.2f}  {'✅' if dl_ok else '⛔ LIMIT HIT'}\n"
+            + (f"  Open P&L: {'+'if open_pnl>=0 else ''}${open_pnl:,.2f}\n" if open_pnl else "")
+            + f"  ID: <code>{acct_id}</code>\n"
         )
-        return
-    bal = ts_get_balance()
-    if not bal:
-        tg_send("⚠️ Couldn't fetch Topstep balance — check credentials.")
-        return
-    daily = float(bal.get("daily_pnl") or 0)
-    open_pnl = float(bal.get("open_pnl") or 0)
-    balance  = float(bal.get("balance") or 0)
-    tg_send(
-        f"🏦 <b>Topstep Balance (LIVE)</b>\n\n"
-        f"Balance: <b>${balance:,.2f}</b>\n"
-        f"Today's P&L: {'+'if daily>=0 else ''}${daily:,.2f}\n"
-        f"Open P&L: {'+'if open_pnl>=0 else ''}${open_pnl:,.2f}\n"
-        f"Daily loss limit: −${DAILY_LOSS_LIMIT:,.0f}  "
-        f"({'⛔ BLOCKED' if daily <= -DAILY_LOSS_LIMIT else '✅ OK'})"
-    )
+    lines.append(f"Daily loss limit per account: −${DAILY_LOSS_LIMIT:,.0f}")
+    tg_send("\n".join(lines))
 
 # ── Wire /yes /no /accounts /balance /setaccount into commands ───
 COMMANDS.setdefault("⚙️ Admin", []).extend([
