@@ -318,17 +318,40 @@ def handle_tg_command(text):
                 open_str   = (f"\n\n📊 <b>Open #{t['id']}</b>: {side} {contracts}MNQ @ {entry}{be_str}\n"
                               f"   Unrealized: ${unreal:+,.2f}  |  Total P&L: <b>${total:+,.2f}</b>  ({remaining} MNQ left)")
 
-        ev = get_eval_status()
-        # Eval progress bar
-        eval_pct  = max(0, min(100, round((ev["eval_pnl"] + 2000) / 5000 * 100)))
-        eval_bar  = "█" * round(eval_pct/10) + "░" * (10 - round(eval_pct/10))
-        dd_pct    = round(ev["drawdown_used"] / 2000 * 100) if ev["drawdown_used"] > 0 else 0
-        eval_str  = (
-            f"\n\n🏦 <b>Eval #{ev['eval_num']}</b>  (Funded: {ev['funded']}  Blown: {ev['blown']})\n"
-            f"Balance: <code>${ev['eval_balance']:,.2f}</code>  ({ev['eval_pnl']:+,.2f} this eval)\n"
-            f"[{eval_bar}] {eval_pct}%\n"
-            f"To target: ${ev['to_target']:,.0f}  |  DD buffer: ${ev['to_floor']:,.0f} left  ({dd_pct}% used)"
-        )
+        # In live mode — pull real balance from Topstep
+        if TRADING_MODE == "live" and TOPSTEP_ACCOUNT_ID:
+            bal = ts_get_balance()
+            if bal:
+                real_bal   = float(bal.get("balance") or 0)
+                daily_pnl  = float(bal.get("daily_pnl") or 0)
+                open_pnl   = float(bal.get("open_pnl") or 0)
+                can_trade  = bal.get("can_trade", True)
+                acct_name  = bal.get("name", TOPSTEP_ACCOUNT_ID)
+                to_target  = max(0, 53000 - real_bal)
+                dd_buffer  = real_bal - 48000
+                eval_pct   = max(0, min(100, round((real_bal - 50000 + 2000) / 5000 * 100)))
+                eval_bar   = "█" * round(eval_pct/10) + "░" * (10 - round(eval_pct/10))
+                trade_flag = "🟢 Can trade" if can_trade else "🔴 Trading disabled"
+                eval_str   = (
+                    f"\n\n🏦 <b>Topstep — {acct_name}</b>\n"
+                    f"Balance: <code>${real_bal:,.2f}</code>  (today: {'+'if daily_pnl>=0 else ''}${daily_pnl:,.2f})\n"
+                    f"[{eval_bar}] {eval_pct}%\n"
+                    f"To target: ${to_target:,.0f}  |  DD buffer: ${dd_buffer:,.0f}\n"
+                    f"{trade_flag}  |  Daily stop: −${DAILY_LOSS_LIMIT:,.0f}"
+                )
+            else:
+                eval_str = "\n\n⚠️ Couldn't fetch Topstep balance"
+        else:
+            ev = get_eval_status()
+            eval_pct  = max(0, min(100, round((ev["eval_pnl"] + 2000) / 5000 * 100)))
+            eval_bar  = "█" * round(eval_pct/10) + "░" * (10 - round(eval_pct/10))
+            dd_pct    = round(ev["drawdown_used"] / 2000 * 100) if ev["drawdown_used"] > 0 else 0
+            eval_str  = (
+                f"\n\n📋 <b>Paper Eval #{ev['eval_num']}</b>  (Funded: {ev['funded']}  Blown: {ev['blown']})\n"
+                f"Balance: <code>${ev['eval_balance']:,.2f}</code>  ({ev['eval_pnl']:+,.2f} this eval)\n"
+                f"[{eval_bar}] {eval_pct}%\n"
+                f"To target: ${ev['to_target']:,.0f}  |  DD buffer: ${ev['to_floor']:,.0f} left  ({dd_pct}% used)"
+            )
 
         tg_send(
             f"<b>Jarvis Status</b>\n\n"
