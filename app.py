@@ -2467,7 +2467,7 @@ def _save_account_id(account_id):
 DAILY_LOSS_LIMIT   = float(os.environ.get("DAILY_LOSS_LIMIT", "500"))  # $500/day hard stop
 
 PROJECTX_BASE = "https://api.topstepx.com"
-PROJECTX_SYMBOL = "CON.F.US.MNQM6"   # Topstep symbol for Micro NQ June 2026
+PROJECTX_SYMBOL = "CON.F.US.MNQU6"   # Micro NQ September 2026 (front month after June expiry)
 
 # ── JWT Token cache ───────────────────────────────────────────────
 _ts_token = {"jwt": None, "expires": 0}
@@ -2653,12 +2653,15 @@ def ts_place_order(side, contracts, order_type="Market", price=None,
             headers=hdrs, json=payload, timeout=10
         )
         data = r.json()
-        print(f"[TOPSTEP] Place order response: {str(data)[:200]}")
+        print(f"[TOPSTEP] Place order response: {str(data)[:300]}")
         order_id = data.get("orderId") or data.get("id")
         if not order_id:
+            err = data.get("errorMessage") or data.get("message") or str(data)[:200]
+            tg_send(f"⚠️ <b>Order failed</b>\n<code>{err}</code>\nSymbol: {PROJECTX_SYMBOL}  Side: {side}  Size: {contracts}")
             print(f"[TOPSTEP] Place order failed: {data}")
         return order_id
     except Exception as e:
+        tg_send(f"⚠️ <b>Order error</b>: {e}")
         print(f"[TOPSTEP] Place order error: {e}")
         return None
 
