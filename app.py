@@ -495,16 +495,17 @@ def handle_tg_command(text):
     elif cmd == "/contractsearch":
         hdrs = ts_headers()
         if not hdrs:
-            tg_send("Auth failed — check credentials.")
+            tg_send("Auth failed.")
             return
         try:
-            r = requests.post(
-                f"{PROJECTX_BASE}/api/Contract/search",
-                headers=hdrs,
-                json={"searchText": "MNQ", "live": True},
-                timeout=10
-            )
-            tg_send(f"Contract search ({r.status_code}):\n<code>{r.text[:800]}</code>")
+            # Try search first
+            r = requests.post(f"{PROJECTX_BASE}/api/Contract/search",
+                headers=hdrs, json={"searchText": "MNQ", "live": True}, timeout=10)
+            tg_send(f"Search ({r.status_code}):\n<code>{r.text[:600]}</code>")
+            # Also try available contracts
+            r2 = requests.post(f"{PROJECTX_BASE}/api/Contract/available",
+                headers=hdrs, json={"live": True}, timeout=10)
+            tg_send(f"Available ({r2.status_code}):\n<code>{r2.text[:600]}</code>")
         except Exception as e:
             tg_send(f"Error: {e}")
 
