@@ -2485,7 +2485,7 @@ def _save_account_id(account_id):
 DAILY_LOSS_LIMIT   = float(os.environ.get("DAILY_LOSS_LIMIT", "500"))  # $500/day hard stop
 
 PROJECTX_BASE = "https://api.topstepx.com"
-PROJECTX_SYMBOL = "CON.F.US.MNQU6"   # Micro NQ September 2026 (front month after June expiry)
+PROJECTX_SYMBOL = "CON.F.US.MNQ.U26"  # Micro NQ September 2026 (confirmed from ProjectX API)
 
 # ── JWT Token cache ───────────────────────────────────────────────
 _ts_token = {"jwt": None, "expires": 0}
