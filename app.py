@@ -491,6 +491,23 @@ def handle_tg_command(text):
     elif any(w in text for w in ["/analysis", "analysis", "analyze", "read", "market", "outlook", "what you seeing", "what do you see", "where we going", "where going"]):
         send_market_analysis()
 
+    # ── /contractsearch — find correct MNQ contract ID ────────────
+    elif cmd == "/contractsearch":
+        hdrs = ts_headers()
+        if not hdrs:
+            tg_send("Auth failed — check credentials.")
+            return
+        try:
+            r = requests.post(
+                f"{PROJECTX_BASE}/api/Contract/search",
+                headers=hdrs,
+                json={"searchText": "MNQ", "live": True},
+                timeout=10
+            )
+            tg_send(f"Contract search ({r.status_code}):\n<code>{r.text[:800]}</code>")
+        except Exception as e:
+            tg_send(f"Error: {e}")
+
     # ── /tstest — raw auth + account debug ────────────────────────
     elif cmd == "/tstest":
         tg_send(f"Testing ProjectX auth...\nUsername: <code>{TOPSTEP_USERNAME}</code>\nKey: <code>...{TOPSTEP_API_KEY[-6:] if TOPSTEP_API_KEY else 'NOT SET'}</code>")
