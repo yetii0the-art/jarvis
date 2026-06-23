@@ -2640,7 +2640,8 @@ def ts_get_open_position(account_id=None):
 # Swagger-confirmed field names:
 #   side: 0=Buy, 1=Sell  |  type: 1=Market, 2=Limit, 3=Stop, 4=StopLimit
 ORDER_SIDE = {"Buy": 0, "Sell": 1}
-ORDER_TYPE = {"Market": 1, "Limit": 2, "Stop": 3, "StopLimit": 4}
+# Topstep valid types: 1=Market, 2=Limit, 4=StopLimit (type 3 Stop rejected)
+ORDER_TYPE = {"Market": 1, "Limit": 2, "Stop": 4, "StopLimit": 4}
 
 def ts_place_order(side, contracts, order_type="Market", price=None,
                    stop_price=None, account_id=None, custom_tag=None):
@@ -2662,7 +2663,16 @@ def ts_place_order(side, contracts, order_type="Market", price=None,
         "size":       contracts,
     }
     if price:       payload["limitPrice"] = price
-    if stop_price:  payload["stopPrice"]  = stop_price
+    if stop_price:
+        payload["stopPrice"] = stop_price
+        # StopLimit requires both stopPrice and limitPrice
+        # Set limit 10pts through so it acts like a stop-market
+        if not price:
+            slip = 10  # 10pt slippage buffer — ensures fill
+            if ORDER_SIDE.get(side, 0) == 1:  # Sell stop — limit is below
+                payload["limitPrice"] = round(stop_price - slip, 2)
+            else:  # Buy stop — limit is above
+                payload["limitPrice"] = round(stop_price + slip, 2)
     if custom_tag:  payload["customTag"]  = str(custom_tag)
 
     try:
