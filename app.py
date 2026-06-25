@@ -562,19 +562,17 @@ def handle_tg_command(text):
         tp1  = round(price + 34, 2)
         tp2  = round(price + 65, 2)
         tp3  = round(price + 100, 2)
-        tg_send(f"🧪 Test BUY 5 MNQ @ market\nSL:{sl} (monitored)  TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+        tg_send(f"🧪 Test BUY 5 MNQ @ market\nSL:{sl}  TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
         entry_oid = ts_place_order("Buy", 5, "Market")
         if entry_oid:
+            sl_oid  = ts_place_order("Sell", 5, "Stop",  stop_price=sl)
             tp1_oid = ts_place_order("Sell", 3, "Limit", price=tp1)
-            tp2_oid = ts_place_order("Sell", 1, "Limit", price=tp2)
-            tp3_oid = ts_place_order("Sell", 1, "Limit", price=tp3)
             tg_send(
-                f"✅ <b>Test bracket placed</b>\n"
+                f"✅ <b>Test bracket placed (cascade)</b>\n"
                 f"Entry: <code>{entry_oid}</code>\n"
-                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c)\n"
-                f"TP2: <code>{tp2_oid or 'FAILED'}</code> @ {tp2} (1c)\n"
-                f"TP3: <code>{tp3_oid or 'FAILED'}</code> @ {tp3} (1c)\n"
-                f"SL @ {sl} monitored by Jarvis — /close to exit all."
+                f"SL:  <code>{sl_oid  or 'FAILED'}</code> @ {sl} (5c Stop Market)\n"
+                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c Limit)\n"
+                f"TP2+TP3 cascade after fills — /close to exit all."
             )
         else:
             tg_send("❌ Test BUY failed — check logs.")
@@ -2844,17 +2842,23 @@ def ts_enter_trade(signal):
         return None
     time.sleep(1)  # brief wait for fill
 
-    # ── Step 2: TP limit orders (live on Topstep's servers) ──────────
-    # SL is NOT placed as an order — Topstep rejects it when TPs already
-    # cover the full position size (no-hedging rule). Jarvis monitors SL
-    # every 10s and cancels TPs + market closes if price hits SL level.
+    # ── Step 2: SL as Stop Market (full size) ─────────────────────────
+    # Cascade approach: SL covers full position. As each TP fills,
+    # Jarvis cancels SL and replaces for remaining size + places next TP.
+    # Total sells never exceed position size → no hedging violation.
+    sl_order_id = ts_place_order(ts_sl_side, contracts, "Stop", stop_price=sl)
+    if not sl_order_id:
+        ts_close_position(contracts, side)
+        tg_send("🚨 <b>SL ORDER FAILED — emergency closed position.</b> Check account.")
+        return None
+
+    # ── Step 3: Place TP1 only — Jarvis cascades TP2/TP3 after each fill ──
+    # (Can't place all TPs at once: 5 SL + 3+1+1 TPs = 10 > 5 position)
     tp1_order_id = ts_place_order(ts_sl_side, c1, "Limit", price=tp1)
-    tp2_order_id = ts_place_order(ts_sl_side, c2, "Limit", price=tp2)
-    tp3_order_id = ts_place_order(ts_sl_side, c3, "Limit", price=tp3)
-    sl_order_id  = None  # monitored in software
-    failed_tps = [lvl for lvl, oid in [("TP1", tp1_order_id), ("TP2", tp2_order_id), ("TP3", tp3_order_id)] if not oid]
-    if failed_tps:
-        tg_send(f"⚠️ <b>TP orders failed: {', '.join(failed_tps)}</b> — position is live, manage manually.")
+    tp2_order_id = None  # placed after TP1 fills
+    tp3_order_id = None  # placed after TP2 fills
+    if not tp1_order_id:
+        tg_send(f"⚠️ <b>TP1 order failed</b> — SL is live @ {sl}, manage TPs manually.")
 
     # ── Log to Supabase ───────────────────────────────────────────
     bio = build_entry_bio(signal)
@@ -2974,31 +2978,41 @@ def check_live_trade():
     hit_tp3 = (side=="BUY" and price >= tp3) or (side=="SELL" and price <= tp3)
     hit_sl  = (side=="BUY" and price <= sl)  or (side=="SELL" and price >= sl)
 
-    # ── TP1 filled (Topstep executed the limit order) ────────────────
+    # ── TP1 filled — cancel full SL, place SL for c2+c3, place TP2 ──
     if hit_tp1 and not s["tp1_hit"] and not hit_tp2:
-        s["tp1_hit"] = True
+        if s["sl_order_id"]:
+            ts_cancel_order(s["sl_order_id"])
+        remaining = c2 + c3
+        new_sl_id = ts_place_order(close_side, remaining, "Stop", stop_price=sl)
+        new_tp2_id = ts_place_order(close_side, c2, "Limit", price=tp2)
+        s["tp1_hit"]     = True
+        s["sl_order_id"] = new_sl_id
+        s["tp2_order_id"] = new_tp2_id
         sb_update("trades", s["trade_id"], {"tp1_hit": True})
-        tg_send(f"✅ <b>TP1 filled</b> — {c1}MNQ closed @ <code>{tp1}</code>  +${round(34*PTS_TO_USD*c1)}")
+        tg_send(
+            f"✅ <b>TP1 filled</b> — {c1}MNQ @ <code>{tp1}</code>  +${round(34*PTS_TO_USD*c1)}\n"
+            f"SL reset for {remaining}c  |  TP2 live @ <code>{tp2}</code>"
+        )
 
-    # ── TP2 filled — cancel old SL, place new SL at breakeven ────────
+    # ── TP2 filled — cancel SL, place SL at BE for c3, place TP3 ────
     if hit_tp2 and not s["tp2_hit"]:
         if s["sl_order_id"]:
             ts_cancel_order(s["sl_order_id"])
-        # Cancel TP3 limit order so we can replace SL logic cleanly if needed
-        # (leave TP3 order live — it'll fill on its own)
-        be_sl_id = ts_place_order(close_side, c3, "Stop", stop_price=entry)
-        s["tp1_hit"] = True
-        s["tp2_hit"] = True
-        s["sl_order_id"] = be_sl_id
-        s["sl"] = entry
+        be_sl_id  = ts_place_order(close_side, c3, "Stop", stop_price=entry)
+        new_tp3_id = ts_place_order(close_side, c3, "Limit", price=tp3)
+        s["tp1_hit"]      = True
+        s["tp2_hit"]      = True
+        s["sl_order_id"]  = be_sl_id
+        s["tp3_order_id"] = new_tp3_id
+        s["sl"]           = entry
         sb_update("trades", s["trade_id"], {"tp1_hit": True, "tp2_hit": True, "sl": entry})
         tg_send(
             f"⚡ <b>TP2 filled — SL → Breakeven</b>\n"
-            f"{c2}MNQ closed @ <code>{tp2}</code>  +${round(65*PTS_TO_USD*c2)}\n"
-            f"SL at entry <code>{entry}</code>  |  {c3}MNQ running to TP3 <code>{tp3}</code>"
+            f"{c2}MNQ @ <code>{tp2}</code>  +${round(65*PTS_TO_USD*c2)}\n"
+            f"SL at entry <code>{entry}</code>  |  TP3 live @ <code>{tp3}</code>"
         )
 
-    # ── TP3 filled — cancel SL, resolve trade ─────────────────────────
+    # ── TP3 filled — cancel SL, resolve ───────────────────────────────
     if hit_tp3:
         if s["sl_order_id"]:
             ts_cancel_order(s["sl_order_id"])
