@@ -3021,22 +3021,23 @@ def check_live_trade():
             f"SL reset for {remaining}c  |  TP2 live @ <code>{tp2}</code>"
         )
 
-    # ── TP2 filled — cancel SL, place SL at BE for c3, place TP3 ────
+    # ── TP2 filled — cancel SL, place SL at TP1 (lock in profit), place TP3 ──
     if hit_tp2 and not s["tp2_hit"]:
         if s["sl_order_id"]:
             ts_cancel_order(s["sl_order_id"])
-        be_sl_id  = ts_place_order(close_side, c3, "Stop", stop_price=entry)
+        locked_sl  = tp1  # SL at TP1 — guaranteed profit even if TP3 misses
+        tp1_sl_id  = ts_place_order(close_side, c3, "Stop", stop_price=locked_sl)
         new_tp3_id = ts_place_order(close_side, c3, "Limit", price=tp3)
         s["tp1_hit"]      = True
         s["tp2_hit"]      = True
-        s["sl_order_id"]  = be_sl_id
+        s["sl_order_id"]  = tp1_sl_id
         s["tp3_order_id"] = new_tp3_id
-        s["sl"]           = entry
-        sb_update("trades", s["trade_id"], {"tp1_hit": True, "tp2_hit": True, "sl": entry})
+        s["sl"]           = locked_sl
+        sb_update("trades", s["trade_id"], {"tp1_hit": True, "tp2_hit": True, "sl": locked_sl})
         tg_send(
-            f"⚡ <b>TP2 filled — SL → Breakeven</b>\n"
+            f"⚡ <b>TP2 filled — SL locked at TP1</b>\n"
             f"{c2}MNQ @ <code>{tp2}</code>  +${round(65*PTS_TO_USD*c2)}\n"
-            f"SL at entry <code>{entry}</code>  |  TP3 live @ <code>{tp3}</code>"
+            f"SL @ <code>{locked_sl}</code> (guaranteed profit)  |  TP3 live @ <code>{tp3}</code>"
         )
 
     # ── TP3 filled — cancel SL, resolve ───────────────────────────────
