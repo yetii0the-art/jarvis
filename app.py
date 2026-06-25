@@ -560,19 +560,17 @@ def handle_tg_command(text):
         tg_send(f"🧪 Firing test SELL 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
         entry_oid = ts_place_order("Sell", 5, "Market")
         if entry_oid:
-            time.sleep(1)  # wait for fill
-            fill = get_live_price() or 0  # price AFTER fill
-            sl   = round(fill + 40, 2)
-            tp1  = round(fill - 34, 2)
-            tp2  = round(fill - 65, 2)
-            tp3  = round(fill - 100, 2)
-            sl_oid  = ts_place_order("Buy", 5, "Stop",  stop_price=sl)
-            tp1_oid = ts_place_order("Buy", 3, "Limit", price=tp1)
+            time.sleep(1)
+            fill = get_live_price() or 0
+            sl  = round(fill + 40, 2)
+            tp1 = round(fill - 34, 2)
+            tp2 = round(fill - 65, 2)
+            tp3 = round(fill - 100, 2)
+            sl_oid = ts_place_order("Buy", 5, "Stop", stop_price=sl)
             tg_send(
-                f"✅ <b>Test SELL bracket</b>  fill ~{fill}\n"
-                f"SL:  <code>{sl_oid  or 'FAILED'}</code> @ {sl} (5c Stop Market)\n"
-                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c)\n"
-                f"TP2:{tp2}  TP3:{tp3} cascade after fills\n/close to exit."
+                f"✅ <b>Test SELL</b>  fill ~{fill}\n"
+                f"SL: <code>{sl_oid or 'FAILED'}</code> @ {sl} (hard stop)\n"
+                f"TP1:{tp1}  TP2:{tp2}  TP3:{tp3} — Jarvis monitors & fires\n/close to exit."
             )
         else:
             tg_send("❌ Test SELL failed — check logs.")
@@ -587,19 +585,17 @@ def handle_tg_command(text):
         tg_send(f"🧪 Firing test BUY 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
         entry_oid = ts_place_order("Buy", 5, "Market")
         if entry_oid:
-            time.sleep(1)  # wait for fill
-            fill = get_live_price() or 0  # price AFTER fill
-            sl   = round(fill - 40, 2)
-            tp1  = round(fill + 34, 2)
-            tp2  = round(fill + 65, 2)
-            tp3  = round(fill + 100, 2)
-            sl_oid  = ts_place_order("Sell", 5, "Stop",  stop_price=sl)
-            tp1_oid = ts_place_order("Sell", 3, "Limit", price=tp1)
+            time.sleep(1)
+            fill = get_live_price() or 0
+            sl  = round(fill - 40, 2)
+            tp1 = round(fill + 34, 2)
+            tp2 = round(fill + 65, 2)
+            tp3 = round(fill + 100, 2)
+            sl_oid = ts_place_order("Sell", 5, "Stop", stop_price=sl)
             tg_send(
-                f"✅ <b>Test BUY bracket</b>  fill ~{fill}\n"
-                f"SL:  <code>{sl_oid  or 'FAILED'}</code> @ {sl} (5c Stop Market)\n"
-                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c)\n"
-                f"TP2:{tp2}  TP3:{tp3} cascade after fills\n/close to exit."
+                f"✅ <b>Test BUY</b>  fill ~{fill}\n"
+                f"SL: <code>{sl_oid or 'FAILED'}</code> @ {sl} (hard stop)\n"
+                f"TP1:{tp1}  TP2:{tp2}  TP3:{tp3} — Jarvis monitors & fires\n/close to exit."
             )
         else:
             tg_send("❌ Test BUY failed — check logs.")
@@ -2869,23 +2865,19 @@ def ts_enter_trade(signal):
         return None
     time.sleep(1)  # brief wait for fill
 
-    # ── Step 2: SL as Stop Market (full size) ─────────────────────────
-    # Cascade approach: SL covers full position. As each TP fills,
-    # Jarvis cancels SL and replaces for remaining size + places next TP.
-    # Total sells never exceed position size → no hedging violation.
-    sl_order_id = ts_place_order(ts_sl_side, contracts, "Stop", stop_price=sl)
+    # ── Step 2: Hard SL as Stop Market (full size) ───────────────────
+    # TPs are NOT pre-placed as orders — Topstep no-hedge rule rejects
+    # SL(5c) + TP1(3c) = 8 sells against 5c position.
+    # Jarvis monitors price every 10s and fires market closes at each TP,
+    # then cancels/replaces SL for remaining size.
+    sl_order_id  = ts_place_order(ts_sl_side, contracts, "Stop", stop_price=sl)
+    tp1_order_id = None
+    tp2_order_id = None
+    tp3_order_id = None
     if not sl_order_id:
         ts_close_position(contracts, side)
         tg_send("🚨 <b>SL ORDER FAILED — emergency closed position.</b> Check account.")
         return None
-
-    # ── Step 3: Place TP1 only — Jarvis cascades TP2/TP3 after each fill ──
-    # (Can't place all TPs at once: 5 SL + 3+1+1 TPs = 10 > 5 position)
-    tp1_order_id = ts_place_order(ts_sl_side, c1, "Limit", price=tp1)
-    tp2_order_id = None  # placed after TP1 fills
-    tp3_order_id = None  # placed after TP2 fills
-    if not tp1_order_id:
-        tg_send(f"⚠️ <b>TP1 order failed</b> — SL is live @ {sl}, manage TPs manually.")
 
     # ── Log to Supabase ───────────────────────────────────────────
     bio = build_entry_bio(signal)
@@ -3005,43 +2997,42 @@ def check_live_trade():
     hit_tp3 = (side=="BUY" and price >= tp3) or (side=="SELL" and price <= tp3)
     hit_sl  = (side=="BUY" and price <= sl)  or (side=="SELL" and price >= sl)
 
-    # ── TP1 filled — cancel full SL, place SL for c2+c3, place TP2 ──
+    # ── TP1 hit — market close c1, cancel SL(full), replace SL(c2+c3) ──
     if hit_tp1 and not s["tp1_hit"] and not hit_tp2:
-        if s["sl_order_id"]:
-            ts_cancel_order(s["sl_order_id"])
-        remaining = c2 + c3
-        new_sl_id = ts_place_order(close_side, remaining, "Stop", stop_price=sl)
-        new_tp2_id = ts_place_order(close_side, c2, "Limit", price=tp2)
-        s["tp1_hit"]     = True
-        s["sl_order_id"] = new_sl_id
-        s["tp2_order_id"] = new_tp2_id
-        sb_update("trades", s["trade_id"], {"tp1_hit": True})
-        tg_send(
-            f"✅ <b>TP1 filled</b> — {c1}MNQ @ <code>{tp1}</code>  +${round(34*PTS_TO_USD*c1)}\n"
-            f"SL reset for {remaining}c  |  TP2 live @ <code>{tp2}</code>"
-        )
+        oid = ts_place_order(close_side, c1, "Market")
+        if oid:
+            if s["sl_order_id"]:
+                ts_cancel_order(s["sl_order_id"])
+            new_sl_id = ts_place_order(close_side, c2+c3, "Stop", stop_price=sl)
+            s["tp1_hit"]      = True
+            s["sl_order_id"]  = new_sl_id
+            sb_update("trades", s["trade_id"], {"tp1_hit": True})
+            tg_send(
+                f"✅ <b>TP1</b> — {c1}MNQ @ market (~<code>{tp1}</code>)  +${round(34*PTS_TO_USD*c1)}\n"
+                f"SL stays @ <code>{sl}</code>  |  {c2+c3}c running to TP2"
+            )
 
-    # ── TP2 filled — cancel SL, place SL at TP1 (lock in profit), place TP3 ──
+    # ── TP2 hit — market close c2, cancel SL, replace SL at TP1 (locked) ──
     if hit_tp2 and not s["tp2_hit"]:
-        if s["sl_order_id"]:
-            ts_cancel_order(s["sl_order_id"])
-        locked_sl  = tp1  # SL at TP1 — guaranteed profit even if TP3 misses
-        tp1_sl_id  = ts_place_order(close_side, c3, "Stop", stop_price=locked_sl)
-        new_tp3_id = ts_place_order(close_side, c3, "Limit", price=tp3)
-        s["tp1_hit"]      = True
-        s["tp2_hit"]      = True
-        s["sl_order_id"]  = tp1_sl_id
-        s["tp3_order_id"] = new_tp3_id
-        s["sl"]           = locked_sl
-        sb_update("trades", s["trade_id"], {"tp1_hit": True, "tp2_hit": True, "sl": locked_sl})
-        tg_send(
-            f"⚡ <b>TP2 filled — SL locked at TP1</b>\n"
-            f"{c2}MNQ @ <code>{tp2}</code>  +${round(65*PTS_TO_USD*c2)}\n"
-            f"SL @ <code>{locked_sl}</code> (guaranteed profit)  |  TP3 live @ <code>{tp3}</code>"
-        )
+        oid = ts_place_order(close_side, c2, "Market")
+        if oid:
+            if s["sl_order_id"]:
+                ts_cancel_order(s["sl_order_id"])
+            locked_sl = tp1  # lock in TP1 profit on final contract
+            new_sl_id = ts_place_order(close_side, c3, "Stop", stop_price=locked_sl)
+            s["tp1_hit"]     = True
+            s["tp2_hit"]     = True
+            s["sl_order_id"] = new_sl_id
+            s["sl"]          = locked_sl
+            sb_update("trades", s["trade_id"], {"tp1_hit": True, "tp2_hit": True, "sl": locked_sl})
+            tg_send(
+                f"⚡ <b>TP2</b> — {c2}MNQ @ market (~<code>{tp2}</code>)  +${round(65*PTS_TO_USD*c2)}\n"
+                f"SL locked @ TP1 <code>{locked_sl}</code>  |  {c3}c free-rolling to TP3 <code>{tp3}</code>"
+            )
 
-    # ── TP3 filled — cancel SL, resolve ───────────────────────────────
+    # ── TP3 hit — market close c3, cancel SL, resolve ─────────────────
     if hit_tp3:
+        oid = ts_place_order(close_side, c3, "Market")
         if s["sl_order_id"]:
             ts_cancel_order(s["sl_order_id"])
         pnl = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, s["contracts"],
