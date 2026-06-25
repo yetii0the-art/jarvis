@@ -2657,8 +2657,9 @@ def ts_get_open_position(account_id=None):
 # Swagger-confirmed field names:
 #   side: 0=Buy, 1=Sell  |  type: 1=Market, 2=Limit, 3=Stop, 4=StopLimit
 ORDER_SIDE = {"Buy": 0, "Sell": 1}
-# Topstep valid types: 1=Market, 2=Limit, 4=StopLimit (type 3 Stop rejected)
-ORDER_TYPE = {"Market": 1, "Limit": 2, "Stop": 4, "StopLimit": 4}
+# ProjectX order types (confirmed from rejected order showing type=1 as Limit):
+# 0=Market, 1=Limit, 2=Stop, 4=StopLimit
+ORDER_TYPE = {"Market": 0, "Limit": 1, "Stop": 4, "StopLimit": 4}
 
 def ts_place_order(side, contracts, order_type="Market", price=None,
                    stop_price=None, account_id=None, custom_tag=None):
