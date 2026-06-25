@@ -570,20 +570,25 @@ def handle_tg_command(text):
                 tp2 = round(fill - 65, 2)
                 tp3 = round(fill - 100, 2)
                 c1, c2, c3 = 3, 1, 1
-                sl_oid = ts_place_order("Buy", 5, "Stop", stop_price=sl)
+                sl_oid  = ts_place_order("Buy", 5, "Stop",  stop_price=sl)
+                tp1_oid = ts_place_order("Buy", 3, "Limit", price=tp1)
+                tp2_oid = ts_place_order("Buy", 1, "Limit", price=tp2)
+                tp3_oid = ts_place_order("Buy", 1, "Limit", price=tp3)
                 _live_trade_state.update({
                     "trade_id": f"TEST-{int(time.time())}", "sl_order_id": sl_oid,
-                    "tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None,
+                    "tp1_order_id": tp1_oid, "tp2_order_id": tp2_oid, "tp3_order_id": tp3_oid,
                     "contracts": 5, "c1": c1, "c2": c2, "c3": c3,
                     "side": "SELL", "entry": fill,
                     "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
                     "tp1_hit": False, "tp2_hit": False,
                 })
                 tg_send(
-                    f"✅ <b>Test SELL</b>  fill ~{fill}\n"
-                    f"SL: <code>{sl_oid or 'FAILED'}</code> @ {sl}\n"
-                    f"TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\n"
-                    f"Jarvis is monitoring — will auto-fire partials ✅\n/close to exit."
+                    f"✅ <b>Test SELL bracket</b>  fill ~{fill}\n\n"
+                    f"SL:  {'✅' if sl_oid  else '❌'} @ {sl}\n"
+                    f"TP1: {'✅' if tp1_oid else '❌'} @ {tp1} (3c)\n"
+                    f"TP2: {'✅' if tp2_oid else '❌'} @ {tp2} (1c)\n"
+                    f"TP3: {'✅' if tp3_oid else '❌'} @ {tp3} (1c)\n\n"
+                    f"/close to exit."
                 )
             else:
                 tg_send("❌ Test SELL failed — check logs.")
@@ -608,6 +613,14 @@ def handle_tg_command(text):
             tp1_oid = ts_place_order("Sell", 3, "Limit", price=tp1)
             tp2_oid = ts_place_order("Sell", 1, "Limit", price=tp2)
             tp3_oid = ts_place_order("Sell", 1, "Limit", price=tp3)
+            _live_trade_state.update({
+                "trade_id": f"TEST-{int(time.time())}", "sl_order_id": sl_oid,
+                "tp1_order_id": tp1_oid, "tp2_order_id": tp2_oid, "tp3_order_id": tp3_oid,
+                "contracts": 5, "c1": 3, "c2": 1, "c3": 1,
+                "side": "BUY", "entry": fill,
+                "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "tp1_hit": False, "tp2_hit": False,
+            })
             tg_send(
                 f"✅ <b>Test BUY bracket</b>  fill ~{fill}\n\n"
                 f"SL:  {'✅' if sl_oid  else '❌'} @ {sl}\n"
