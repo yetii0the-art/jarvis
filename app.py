@@ -557,23 +557,36 @@ def handle_tg_command(text):
 
     # ── /testsell — full bracket sell (mirrors real sell trade) ──────
     elif cmd == "/testsell":
-        tg_send(f"🧪 Firing test SELL 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
-        entry_oid = ts_place_order("Sell", 5, "Market")
-        if entry_oid:
-            time.sleep(1)
-            fill = get_live_price() or 0
-            sl  = round(fill + 40, 2)
-            tp1 = round(fill - 34, 2)
-            tp2 = round(fill - 65, 2)
-            tp3 = round(fill - 100, 2)
-            sl_oid = ts_place_order("Buy", 5, "Stop", stop_price=sl)
-            tg_send(
-                f"✅ <b>Test SELL</b>  fill ~{fill}\n"
-                f"SL: <code>{sl_oid or 'FAILED'}</code> @ {sl} (hard stop)\n"
-                f"TP1:{tp1}  TP2:{tp2}  TP3:{tp3} — Jarvis monitors & fires\n/close to exit."
-            )
+        if _live_trade_state["trade_id"]:
+            tg_send("⚠️ Already tracking a trade. /close first.")
         else:
-            tg_send("❌ Test SELL failed — check logs.")
+            tg_send(f"🧪 Firing test SELL 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+            entry_oid = ts_place_order("Sell", 5, "Market")
+            if entry_oid:
+                time.sleep(1)
+                fill = get_live_price() or 0
+                sl  = round(fill + 40, 2)
+                tp1 = round(fill - 34, 2)
+                tp2 = round(fill - 65, 2)
+                tp3 = round(fill - 100, 2)
+                c1, c2, c3 = 3, 1, 1
+                sl_oid = ts_place_order("Buy", 5, "Stop", stop_price=sl)
+                _live_trade_state.update({
+                    "trade_id": f"TEST-{int(time.time())}", "sl_order_id": sl_oid,
+                    "tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None,
+                    "contracts": 5, "c1": c1, "c2": c2, "c3": c3,
+                    "side": "SELL", "entry": fill,
+                    "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                    "tp1_hit": False, "tp2_hit": False,
+                })
+                tg_send(
+                    f"✅ <b>Test SELL</b>  fill ~{fill}\n"
+                    f"SL: <code>{sl_oid or 'FAILED'}</code> @ {sl}\n"
+                    f"TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\n"
+                    f"Jarvis is monitoring — will auto-fire partials ✅\n/close to exit."
+                )
+            else:
+                tg_send("❌ Test SELL failed — check logs.")
 
     # ── /testbuy — full bracket: entry + SL + TP1/2/3 (mirrors real trade) ──
     elif cmd == "/testbuy":
@@ -582,23 +595,37 @@ def handle_tg_command(text):
         tp1  = round(price + 34, 2)
         tp2  = round(price + 65, 2)
         tp3  = round(price + 100, 2)
-        tg_send(f"🧪 Firing test BUY 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
-        entry_oid = ts_place_order("Buy", 5, "Market")
-        if entry_oid:
-            time.sleep(1)
-            fill = get_live_price() or 0
-            sl  = round(fill - 40, 2)
-            tp1 = round(fill + 34, 2)
-            tp2 = round(fill + 65, 2)
-            tp3 = round(fill + 100, 2)
-            sl_oid = ts_place_order("Sell", 5, "Stop", stop_price=sl)
-            tg_send(
-                f"✅ <b>Test BUY</b>  fill ~{fill}\n"
-                f"SL: <code>{sl_oid or 'FAILED'}</code> @ {sl} (hard stop)\n"
-                f"TP1:{tp1}  TP2:{tp2}  TP3:{tp3} — Jarvis monitors & fires\n/close to exit."
-            )
+        if _live_trade_state["trade_id"]:
+            tg_send("⚠️ Already tracking a trade. /close first.")
         else:
-            tg_send("❌ Test BUY failed — check logs.")
+            tg_send(f"🧪 Firing test BUY 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+            entry_oid = ts_place_order("Buy", 5, "Market")
+            if entry_oid:
+                time.sleep(1)
+                fill = get_live_price() or 0
+                sl  = round(fill - 40, 2)
+                tp1 = round(fill + 34, 2)
+                tp2 = round(fill + 65, 2)
+                tp3 = round(fill + 100, 2)
+                c1, c2, c3 = 3, 1, 1
+                sl_oid = ts_place_order("Sell", 5, "Stop", stop_price=sl)
+                # Wire into Jarvis state so TP monitoring works
+                _live_trade_state.update({
+                    "trade_id": f"TEST-{int(time.time())}", "sl_order_id": sl_oid,
+                    "tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None,
+                    "contracts": 5, "c1": c1, "c2": c2, "c3": c3,
+                    "side": "BUY", "entry": fill,
+                    "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                    "tp1_hit": False, "tp2_hit": False,
+                })
+                tg_send(
+                    f"✅ <b>Test BUY</b>  fill ~{fill}\n"
+                    f"SL: <code>{sl_oid or 'FAILED'}</code> @ {sl}\n"
+                    f"TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\n"
+                    f"Jarvis is monitoring — will auto-fire partials ✅\n/close to exit."
+                )
+            else:
+                tg_send("❌ Test BUY failed — check logs.")
 
     # ── /lockin — move SL to TP1 price ───────────────────────────────
     elif cmd in ("/lockin", "lockin", "lock", "lock in"):
