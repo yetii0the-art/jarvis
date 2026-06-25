@@ -555,12 +555,20 @@ def handle_tg_command(text):
             _save_account_id(new_id)
             tg_send(f"✅ Active account set to <code>{new_id}</code> — saved permanently.\nSwitch anytime with /setaccount.")
 
-    # ── /testbuy — fire 1 contract market buy right now ──────────────
+    # ── /testbuy — fire 5 contract market buy with SL (mirrors real trade) ──
     elif cmd == "/testbuy":
-        tg_send(f"🧪 Firing test BUY 1 MNQ @ market on account <code>{TOPSTEP_ACCOUNT_ID}</code>...")
-        oid = ts_place_order("Buy", 1, "Market")
-        if oid:
-            tg_send(f"✅ <b>Test BUY placed</b> — order ID: <code>{oid}</code>\nCheck Topstep to confirm fill. Use /close to exit.")
+        price = get_live_price() or 0
+        sl    = round(price - 40, 2) if price else 0
+        tg_send(f"🧪 Firing test BUY 5 MNQ @ market  SL: {sl}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+        entry_oid = ts_place_order("Buy", 5, "Market")
+        if entry_oid:
+            sl_oid = ts_place_order("Sell", 5, "Stop", stop_price=sl) if sl else None
+            tg_send(
+                f"✅ <b>Test BUY placed</b>\n"
+                f"Entry order: <code>{entry_oid}</code>\n"
+                f"SL order: <code>{sl_oid or 'FAILED'}</code>  @ {sl}\n"
+                f"Use /close to exit."
+            )
         else:
             tg_send("❌ Test BUY failed — check logs.")
 
@@ -2657,9 +2665,9 @@ def ts_get_open_position(account_id=None):
 # Swagger-confirmed field names:
 #   side: 0=Buy, 1=Sell  |  type: 1=Market, 2=Limit, 3=Stop, 4=StopLimit
 ORDER_SIDE = {"Buy": 0, "Sell": 1}
-# ProjectX order types (confirmed from rejected order showing type=1 as Limit):
-# 0=Market, 1=Limit, 2=Stop, 4=StopLimit
-ORDER_TYPE = {"Market": 0, "Limit": 1, "Stop": 4, "StopLimit": 4}
+# ProjectX order types (confirmed from Swagger v1):
+# 0=Unknown, 1=Limit, 2=Market, 3=StopLimit, 4=Stop, 5=TrailingStop
+ORDER_TYPE = {"Market": 2, "Limit": 1, "Stop": 4, "StopLimit": 3}
 
 def ts_place_order(side, contracts, order_type="Market", price=None,
                    stop_price=None, account_id=None, custom_tag=None):
