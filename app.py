@@ -3012,9 +3012,9 @@ _live_trade_state = {
 
 def check_live_trade():
     """
-    Called every 10s when TRADING_MODE=live.
-    Monitors price vs TP levels — places partial close orders at each TP.
-    Handles: TP1 close c1 → TP2 close c2 + cancel SL + place SL at BE → TP3 close c3.
+    Called every 10s. Monitors ACTUAL position size on Topstep — not price.
+    TPs are real limit orders on exchange. SL is real stop order.
+    Jarvis watches for size changes and cancels orphaned orders.
     """
     if TRADING_MODE != "live":
         return
@@ -3022,119 +3022,73 @@ def check_live_trade():
     if not s["trade_id"] or not s["side"]:
         return
 
-    price = get_live_price()
-    if not price:
-        return
-
-    # ── Sync check: verify position still exists on Topstep ──────────
-    real_pos = ts_get_open_position()
-    if not real_pos:
-        # Position gone (SL hit, manual close, etc.) — figure out result from price
-        tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
-        hit_sl  = (s["side"]=="BUY" and price <= s["sl"])  or (s["side"]=="SELL" and price >= s["sl"])
-        hit_tp3 = (s["side"]=="BUY" and price >= s["tp3"]) or (s["side"]=="SELL" and price <= s["tp3"])
-        if tp2h:
-            result = "WIN"
-        elif tp1h:
-            result = "WIN"
-        elif hit_tp3:
-            result = "WIN"
-        else:
-            result = "LOSS"
-        # Cancel any dangling SL order
-        if s["sl_order_id"]:
-            ts_cancel_order(s["sl_order_id"])
-        pnl = calc_scaled_pnl(s["entry"], s["side"], s["tp1"], s["tp2"], s["tp3"],
-                               s["sl"], s["contracts"], tp1h, tp2h, hit_tp3, not hit_tp3 and not hit_tp3)
-        tg_send(f"⚠️ <b>Position closed externally</b> — syncing Jarvis state.\nResult: {result}  |  P&L: ${pnl:+,.2f}")
-        _resolve_live_trade(result, tp1h, tp2h, hit_tp3, not (tp1h or tp2h or hit_tp3), pnl)
-        return
-
-    side  = s["side"]
-    entry = s["entry"]
-    sl    = s["sl"]
-    tp1   = s["tp1"]
-    tp2   = s["tp2"]
-    tp3   = s["tp3"]
     c1, c2, c3 = s["c1"], s["c2"], s["c3"]
-    close_side = "Sell" if side == "BUY" else "Buy"
+    contracts   = s["contracts"]
+    entry       = s["entry"]
+    side        = s["side"]
+    tp1, tp2, tp3, sl = s["tp1"], s["tp2"], s["tp3"], s["sl"]
+    close_side  = "Sell" if side == "BUY" else "Buy"
 
-    hit_tp1 = (side=="BUY" and price >= tp1) or (side=="SELL" and price <= tp1)
-    hit_tp2 = (side=="BUY" and price >= tp2) or (side=="SELL" and price <= tp2)
-    hit_tp3 = (side=="BUY" and price >= tp3) or (side=="SELL" and price <= tp3)
-    hit_sl  = (side=="BUY" and price <= sl)  or (side=="SELL" and price >= sl)
+    real_pos  = ts_get_open_position()
+    real_size = abs(int(real_pos.get("netPos") or real_pos.get("size") or 0)) if real_pos else 0
 
-    # ── TP1 hit — market close c1, cancel SL(full), replace SL(c2+c3) ──
-    if hit_tp1 and not s["tp1_hit"] and not hit_tp2:
-        oid = ts_place_order(close_side, c1, "Market")
-        if oid:
-            if s["sl_order_id"]:
-                ts_cancel_order(s["sl_order_id"])
-            new_sl_id = ts_place_order(close_side, c2+c3, "Stop", stop_price=sl)
-            s["tp1_hit"]      = True
-            s["sl_order_id"]  = new_sl_id
-            sb_update("trades", s["trade_id"], {"tp1_hit": True})
-            tg_send(
-                f"✅ <b>TP1</b> — {c1}MNQ @ market (~<code>{tp1}</code>)  +${round(34*PTS_TO_USD*c1)}\n"
-                f"SL stays @ <code>{sl}</code>  |  {c2+c3}c running to TP2"
-            )
-
-    # ── TP2 hit — market close c2, cancel SL, replace SL at TP1 (locked) ──
-    if hit_tp2 and not s["tp2_hit"]:
-        oid = ts_place_order(close_side, c2, "Market")
-        if oid:
-            if s["sl_order_id"]:
-                ts_cancel_order(s["sl_order_id"])
-            locked_sl = tp1  # lock in TP1 profit on final contract
-            new_sl_id = ts_place_order(close_side, c3, "Stop", stop_price=locked_sl)
-            s["tp1_hit"]     = True
-            s["tp2_hit"]     = True
-            s["sl_order_id"] = new_sl_id
-            s["sl"]          = locked_sl
-            sb_update("trades", s["trade_id"], {"tp1_hit": True, "tp2_hit": True, "sl": locked_sl})
-            tp1_usd = round(34*PTS_TO_USD*c1)
-            tp2_usd = round(65*PTS_TO_USD*c2)
-            tp3_usd = round(100*PTS_TO_USD*c3)
-            tg_send(
-                f"⚡ <b>TP2 HIT — SL locked @ TP1</b>\n\n"
-                f"Closed {c2}MNQ @ ~<code>{tp2}</code>  +${tp2_usd}\n"
-                f"SL → <code>{locked_sl}</code>  (worst case: +${tp1_usd+tp2_usd} total)\n"
-                f"TP3 @ <code>{tp3}</code>  (best case: +${tp1_usd+tp2_usd+tp3_usd} total)\n\n"
-                f"🔒 Profit locked  |  /close to exit now  |  let it ride to TP3"
-            )
-
-    # ── TP3 hit — market close c3, cancel SL, resolve ─────────────────
-    if hit_tp3:
-        oid = ts_place_order(close_side, c3, "Market")
-        if s["sl_order_id"]:
-            ts_cancel_order(s["sl_order_id"])
-        pnl = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, s["contracts"],
-                               True, True, True, False)
-        _resolve_live_trade("WIN", True, True, True, False, pnl)
+    # ── Position fully closed (SL hit or all TPs filled) ─────────────
+    if real_size == 0:
+        tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
+        # Cancel ALL remaining orders — critical to prevent orphan TP
+        # orders reopening a position after an SL hit
+        ts_cancel_all_orders()
+        if tp2h:
+            result, tp3h, slh = "WIN", False, False
+        elif tp1h:
+            result, tp3h, slh = "WIN", False, False
+        else:
+            result, tp3h, slh = "LOSS", False, True
+        pnl = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, contracts,
+                               tp1h, tp2h, tp3h, slh)
+        tg_send(f"{'✅' if result=='WIN' else '❌'} <b>Trade closed</b>  {result}  P&L: ${pnl:+,.2f}")
+        _resolve_live_trade(result, tp1h, tp2h, tp3h, slh, pnl)
         return
 
-    # ── SL hit — cancel all live TP orders, market close remaining ───
-    if hit_sl and not hit_tp3:
-        tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
-        # Cancel any unfilled TP orders still on the exchange
-        for tp_key in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
-            oid = s.get(tp_key)
-            if oid:
-                ts_cancel_order(oid)
-        # Close remaining contracts at market
-        remaining = c3 if tp2h else (c2 + c3) if tp1h else contracts
-        if remaining > 0:
-            ts_place_order(close_side, remaining, "Market")
-        if tp2h:
-            result = "WIN"
-        elif tp1h:
-            result = "WIN"
-        else:
-            result = "LOSS"
-        pnl = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, s["contracts"],
-                               tp1h, tp2h, False, True)
-        tg_send(f"🛑 <b>SL hit @ {sl}</b> — closed {remaining}MNQ @ market\nResult: {result}  P&L: ${pnl:+,.2f}")
-        _resolve_live_trade(result, tp1h, tp2h, False, True, pnl)
+    # ── TP1 filled: position dropped from 5 → 2 ──────────────────────
+    expected_after_tp1 = c2 + c3
+    if not s["tp1_hit"] and real_size == expected_after_tp1:
+        if s["sl_order_id"]:
+            ts_cancel_order(s["sl_order_id"])
+        new_sl_id = ts_place_order(close_side, int(c2+c3), "Stop", stop_price=sl)
+        s["tp1_hit"]     = True
+        s["sl_order_id"] = new_sl_id
+        sb_update("trades", s["trade_id"], {"tp1_hit": True})
+        tg_send(
+            f"✅ <b>TP1 filled</b> — {c1}MNQ closed  +${round(34*PTS_TO_USD*c1)}\n"
+            f"SL reset @ <code>{sl}</code> for {c2+c3}c  |  TP2 @ <code>{tp2}</code>"
+        )
+
+    # ── TP2 filled: position dropped to c3 ───────────────────────────
+    if s["tp1_hit"] and not s["tp2_hit"] and real_size == c3:
+        if s["sl_order_id"]:
+            ts_cancel_order(s["sl_order_id"])
+        locked_sl = tp1
+        new_sl_id = ts_place_order(close_side, int(c3), "Stop", stop_price=locked_sl)
+        s["tp2_hit"]     = True
+        s["sl_order_id"] = new_sl_id
+        s["sl"]          = locked_sl
+        sb_update("trades", s["trade_id"], {"tp2_hit": True, "sl": locked_sl})
+        tp1_usd = round(34*PTS_TO_USD*c1)
+        tp2_usd = round(65*PTS_TO_USD*c2)
+        tp3_usd = round(100*PTS_TO_USD*c3)
+        tg_send(
+            f"⚡ <b>TP2 filled — SL locked @ TP1</b>\n\n"
+            f"{c2}MNQ closed  +${tp2_usd}\n"
+            f"SL → <code>{locked_sl}</code>  (floor: +${tp1_usd+tp2_usd})\n"
+            f"TP3 @ <code>{tp3}</code>  (max: +${tp1_usd+tp2_usd+tp3_usd})\n\n"
+            f"🔒 Profit locked  |  /close to bank now  |  let it ride"
+        )
+
+    # ── SL hit with partial TPs already taken ─────────────────────────
+    # (position > 0 but SL stop order filled — handled on next poll when size=0)
+    # Nothing to do here — next 10s poll will catch size=0 and resolve.
+
 
 def _resolve_live_trade(result, tp1h, tp2h, tp3h, slh, pnl_usd):
     """Write final result to Supabase and send Telegram close message."""
