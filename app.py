@@ -595,37 +595,29 @@ def handle_tg_command(text):
         tp1  = round(price + 34, 2)
         tp2  = round(price + 65, 2)
         tp3  = round(price + 100, 2)
-        if _live_trade_state["trade_id"]:
-            tg_send("⚠️ Already tracking a trade. /close first.")
+        tg_send(f"🧪 Test BUY 5 MNQ — full bracket attempt...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+        entry_oid = ts_place_order("Buy", 5, "Market")
+        if entry_oid:
+            time.sleep(1)
+            fill = get_live_price() or 0
+            sl  = round(fill - 40, 2)
+            tp1 = round(fill + 34, 2)
+            tp2 = round(fill + 65, 2)
+            tp3 = round(fill + 100, 2)
+            sl_oid  = ts_place_order("Sell", 5, "Stop",  stop_price=sl)
+            tp1_oid = ts_place_order("Sell", 3, "Limit", price=tp1)
+            tp2_oid = ts_place_order("Sell", 1, "Limit", price=tp2)
+            tp3_oid = ts_place_order("Sell", 1, "Limit", price=tp3)
+            tg_send(
+                f"✅ <b>Test BUY bracket</b>  fill ~{fill}\n\n"
+                f"SL:  {'✅' if sl_oid  else '❌'} @ {sl}\n"
+                f"TP1: {'✅' if tp1_oid else '❌'} @ {tp1} (3c)\n"
+                f"TP2: {'✅' if tp2_oid else '❌'} @ {tp2} (1c)\n"
+                f"TP3: {'✅' if tp3_oid else '❌'} @ {tp3} (1c)\n\n"
+                f"/close to exit."
+            )
         else:
-            tg_send(f"🧪 Firing test BUY 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
-            entry_oid = ts_place_order("Buy", 5, "Market")
-            if entry_oid:
-                time.sleep(1)
-                fill = get_live_price() or 0
-                sl  = round(fill - 40, 2)
-                tp1 = round(fill + 34, 2)
-                tp2 = round(fill + 65, 2)
-                tp3 = round(fill + 100, 2)
-                c1, c2, c3 = 3, 1, 1
-                sl_oid = ts_place_order("Sell", 5, "Stop", stop_price=sl)
-                # Wire into Jarvis state so TP monitoring works
-                _live_trade_state.update({
-                    "trade_id": f"TEST-{int(time.time())}", "sl_order_id": sl_oid,
-                    "tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None,
-                    "contracts": 5, "c1": c1, "c2": c2, "c3": c3,
-                    "side": "BUY", "entry": fill,
-                    "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                    "tp1_hit": False, "tp2_hit": False,
-                })
-                tg_send(
-                    f"✅ <b>Test BUY</b>  fill ~{fill}\n"
-                    f"SL: <code>{sl_oid or 'FAILED'}</code> @ {sl}\n"
-                    f"TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\n"
-                    f"Jarvis is monitoring — will auto-fire partials ✅\n/close to exit."
-                )
-            else:
-                tg_send("❌ Test BUY failed — check logs.")
+            tg_send("❌ Test BUY failed — check logs.")
 
     # ── /lockin — move SL to TP1 price ───────────────────────────────
     elif cmd in ("/lockin", "lockin", "lock", "lock in"):
@@ -706,7 +698,46 @@ def telegram_poll_loop():
         print("[TG] No token — skipping")
         return
 
-    print("[TG] Starting poll loop...")
+    # Distributed lock — only one Railway instance may poll at a time.
+    # Write a heartbeat to Supabase every 20s; if another instance sees
+    # a fresh heartbeat (<15s old) it backs off.
+    import socket
+    INSTANCE_ID = f"{socket.gethostname()}-{os.getpid()}"
+    LOCK_KEY    = "TG_POLL_LOCK"
+
+    def try_acquire_lock():
+        """Return True if this instance owns the polling lock."""
+        try:
+            rows = sb_select("signals_log", extra=f"&notes=like.{LOCK_KEY}%25&order=id.desc&limit=1")
+            if rows:
+                note = rows[0]["notes"]
+                ts_str = note.split("|")[-1].strip()
+                try:
+                    ts = float(ts_str)
+                    if time.time() - ts < 15 and INSTANCE_ID not in note:
+                        return False  # another instance is alive
+                except:
+                    pass
+            # Write/refresh our lock
+            requests.delete(f"{SB_REST}/signals_log?notes=like.{LOCK_KEY}%25", headers=SB_HEADERS, timeout=5)
+            sb_insert("signals_log", {"side":"SYS","entry":0,"sl":0,"tp1":0,"tp2":0,"tp3":0,
+                "contracts":0,"session":"SYS","strength":0,"taken":False,"skipped":False,
+                "notes":f"{LOCK_KEY}:{INSTANCE_ID}|{time.time()}"})
+            return True
+        except:
+            return True  # if Supabase is down, proceed anyway
+
+    # Wait up to 10s for lock
+    for _ in range(10):
+        if try_acquire_lock():
+            break
+        print(f"[TG] Instance {INSTANCE_ID} waiting for lock...")
+        time.sleep(1)
+    else:
+        print(f"[TG] Could not acquire lock — another instance is polling. Exiting poll loop.")
+        return
+
+    print(f"[TG] Starting poll loop (instance {INSTANCE_ID})...")
 
     # Drain existing updates so we don't replay old messages on startup
     try:
@@ -737,7 +768,12 @@ def telegram_poll_loop():
     )
     print("[TG] Startup message sent")
 
+    _last_heartbeat = [0]
     while True:
+        # Refresh lock heartbeat every 20s
+        if time.time() - _last_heartbeat[0] > 20:
+            try_acquire_lock()
+            _last_heartbeat[0] = time.time()
         try:
             updates = tg_get_updates()
             for upd in updates:
