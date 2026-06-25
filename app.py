@@ -563,8 +563,7 @@ def handle_tg_command(text):
             tg_send(f"🧪 Firing test SELL 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
             entry_oid = ts_place_order("Sell", 5, "Market")
             if entry_oid:
-                time.sleep(1)
-                fill = get_live_price() or 0
+                fill = ts_get_fill_price()
                 sl  = round(fill + 40, 2)
                 tp1 = round(fill - 34, 2)
                 tp2 = round(fill - 65, 2)
@@ -603,8 +602,7 @@ def handle_tg_command(text):
         tg_send(f"🧪 Test BUY 5 MNQ — full bracket attempt...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
         entry_oid = ts_place_order("Buy", 5, "Market")
         if entry_oid:
-            time.sleep(1)
-            fill = get_live_price() or 0
+            fill = ts_get_fill_price()
             sl  = round(fill - 40, 2)
             tp1 = round(fill + 34, 2)
             tp2 = round(fill + 65, 2)
@@ -2751,7 +2749,6 @@ def ts_get_open_position(account_id=None):
     if not hdrs or not acct:
         return None
     try:
-        # Correct endpoint: /api/Position/searchOpen
         r = requests.post(
             f"{PROJECTX_BASE}/api/Position/searchOpen",
             headers=hdrs,
@@ -2768,6 +2765,23 @@ def ts_get_open_position(account_id=None):
     except Exception as e:
         print(f"[TOPSTEP] Position check error: {e}")
         return None
+
+def ts_get_fill_price(retries=5, delay=0.5):
+    """
+    Get actual fill price from open position after a market entry.
+    Falls back to live price if position not yet visible.
+    avgPrice is the real fill — not a market price sample.
+    """
+    for _ in range(retries):
+        pos = ts_get_open_position()
+        if pos:
+            fill = (pos.get("avgPrice") or pos.get("averagePrice") or
+                    pos.get("entryPrice") or pos.get("openPrice") or
+                    pos.get("price") or 0)
+            if fill:
+                return float(fill)
+        time.sleep(delay)
+    return get_live_price() or 0
 
 # ── Place order ───────────────────────────────────────────────────
 # Swagger-confirmed field names:
@@ -2943,17 +2957,23 @@ def ts_enter_trade(signal):
     if not entry_order_id:
         tg_send("⚠️ <b>Entry order FAILED</b> — check Topstep account manually.")
         return None
-    time.sleep(1)  # brief wait for fill
 
-    # ── Step 2: Hard SL as Stop Market (full size) ───────────────────
-    # TPs are NOT pre-placed as orders — Topstep no-hedge rule rejects
-    # SL(5c) + TP1(3c) = 8 sells against 5c position.
-    # Jarvis monitors price every 10s and fires market closes at each TP,
-    # then cancels/replaces SL for remaining size.
+    # Get actual fill price from Topstep position (not a price sample)
+    actual_fill = ts_get_fill_price()
+    if actual_fill and abs(actual_fill - entry) > 5:
+        # Slippage detected — recalculate SL/TPs from real fill
+        diff = actual_fill - entry
+        sl   = round(sl  + diff, 2)
+        tp1  = round(tp1 + diff, 2)
+        tp2  = round(tp2 + diff, 2)
+        tp3  = round(tp3 + diff, 2)
+        entry = actual_fill
+        print(f"[LIVE] Slippage adjusted: fill={actual_fill}, SL={sl}, TP1={tp1}")
+
     sl_order_id  = ts_place_order(ts_sl_side, contracts, "Stop", stop_price=sl)
-    tp1_order_id = None
-    tp2_order_id = None
-    tp3_order_id = None
+    tp1_order_id = ts_place_order(ts_sl_side, c1, "Limit", price=tp1)
+    tp2_order_id = ts_place_order(ts_sl_side, c2, "Limit", price=tp2)
+    tp3_order_id = ts_place_order(ts_sl_side, c3, "Limit", price=tp3)
     if not sl_order_id:
         ts_close_position(contracts, side)
         tg_send("🚨 <b>SL ORDER FAILED — emergency closed position.</b> Check account.")
