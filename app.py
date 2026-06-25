@@ -3275,19 +3275,30 @@ def handle_close_command():
     # Step 2: get real position from Topstep
     real_pos = ts_get_open_position()
     if real_pos:
-        # Try all known field names for position size
-        net = int(real_pos.get("netPos") or real_pos.get("size") or real_pos.get("qty") or 0)
-        if net == 0:
-            # fallback: use Jarvis state
-            net = s["contracts"] if s["side"] == "BUY" else -s["contracts"]
-        size       = abs(net)
-        close_side = "Sell" if net > 0 else "Buy"
-        price      = get_live_price() or 0
+        print(f"[CLOSE] Position raw: {real_pos}")
+        # Size — try signed netPos first, fallback to abs fields
+        raw_net  = real_pos.get("netPos") or real_pos.get("netSize") or 0
+        size     = abs(int(raw_net))
+        if size == 0:
+            size = abs(int(real_pos.get("size") or real_pos.get("qty") or s.get("contracts") or 0))
+        # Direction — use position side field; netPos sign; or Jarvis state
+        pos_side = str(real_pos.get("side") or "").lower()
+        if pos_side in ("long", "buy", "0"):
+            close_side = "Sell"
+        elif pos_side in ("short", "sell", "1"):
+            close_side = "Buy"
+        elif int(raw_net or 0) < 0:
+            close_side = "Buy"   # negative netPos = short → close with buy
+        elif s.get("side"):
+            close_side = "Sell" if s["side"] == "BUY" else "Buy"
+        else:
+            close_side = "Sell" if int(raw_net or 0) >= 0 else "Buy"
+        price = get_live_price() or 0
         oid = ts_place_order(close_side, size, "Market")
         if oid:
             tg_send(f"🔴 <b>CLOSED</b> — {size}MNQ {close_side} @ market (~{price})\n{cancelled} orders cancelled")
         else:
-            tg_send(f"⚠️ Close order FAILED — {size}MNQ {close_side}. Cancel {cancelled} orders. Check Topstep NOW.")
+            tg_send(f"⚠️ Close order FAILED — {size}MNQ {close_side}. {cancelled} orders cancelled. Check Topstep NOW.")
     elif cancelled:
         tg_send(f"No open position found — cancelled {cancelled} dangling orders. Clean.")
     else:
