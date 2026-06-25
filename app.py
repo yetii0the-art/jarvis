@@ -555,6 +555,15 @@ def handle_tg_command(text):
             _save_account_id(new_id)
             tg_send(f"✅ Active account set to <code>{new_id}</code> — saved permanently.\nSwitch anytime with /setaccount.")
 
+    # ── /testbuy — fire 1 contract market buy right now ──────────────
+    elif cmd == "/testbuy":
+        tg_send(f"🧪 Firing test BUY 1 MNQ @ market on account <code>{TOPSTEP_ACCOUNT_ID}</code>...")
+        oid = ts_place_order("Buy", 1, "Market")
+        if oid:
+            tg_send(f"✅ <b>Test BUY placed</b> — order ID: <code>{oid}</code>\nCheck Topstep to confirm fill. Use /close to exit.")
+        else:
+            tg_send("❌ Test BUY failed — check logs.")
+
     # ── /breakeven — move stop to entry ──────────────────────────────
     elif cmd in ("/breakeven", "breakeven", "be"):
         handle_breakeven_command()
