@@ -2715,16 +2715,16 @@ def ts_place_order(side, contracts, order_type="Market", price=None,
         "type":       ORDER_TYPE.get(order_type, 1),
         "size":       contracts,
     }
-    if price:       payload["limitPrice"] = price
+    if price:
+        payload["limitPrice"] = price
     if stop_price:
         payload["stopPrice"] = stop_price
-        # StopLimit requires both stopPrice and limitPrice
-        # Set limit 10pts through so it acts like a stop-market
-        if not price:
-            slip = 10  # 10pt slippage buffer — ensures fill
-            if ORDER_SIDE.get(side, 0) == 1:  # Sell stop — limit is below
+        # StopLimit (type 3) requires limitPrice — Stop (type 4) does NOT
+        if order_type == "StopLimit" and not price:
+            slip = 10
+            if ORDER_SIDE.get(side, 0) == 1:  # Sell stop — limit below
                 payload["limitPrice"] = round(stop_price - slip, 2)
-            else:  # Buy stop — limit is above
+            else:                              # Buy stop — limit above
                 payload["limitPrice"] = round(stop_price + slip, 2)
     if custom_tag:  payload["customTag"]  = str(custom_tag)
 
