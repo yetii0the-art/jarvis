@@ -555,6 +555,14 @@ def handle_tg_command(text):
             _save_account_id(new_id)
             tg_send(f"✅ Active account set to <code>{new_id}</code> — saved permanently.\nSwitch anytime with /setaccount.")
 
+    # ── /breakeven — move stop to entry ──────────────────────────────
+    elif cmd in ("/breakeven", "breakeven", "be"):
+        handle_breakeven_command()
+
+    # ── /close — emergency close position ────────────────────────────
+    elif cmd in ("/close", "close", "exit", "get out"):
+        handle_close_command()
+
     # ── /yes — approve pending confirmation signal ─────────────────
     elif cmd in ("/yes", "yes", "y", "take it", "take"):
         sig = _pending_confirmation.get("signal")
@@ -2693,6 +2701,30 @@ def ts_place_order(side, contracts, order_type="Market", price=None,
         print(f"[TOPSTEP] Place order error: {e}")
         return None
 
+def ts_cancel_all_orders(account_id=None):
+    """Cancel all open orders for this account."""
+    acct = account_id or TOPSTEP_ACCOUNT_ID
+    hdrs = ts_headers()
+    if not hdrs or not acct:
+        return 0
+    try:
+        r = requests.post(
+            f"{PROJECTX_BASE}/api/Order/searchOpen",
+            headers=hdrs, json={"accountId": int(acct)}, timeout=10
+        )
+        data = r.json()
+        orders = data if isinstance(data, list) else (data.get("orders") or data.get("data") or [])
+        cancelled = 0
+        for o in orders:
+            oid = o.get("id") or o.get("orderId")
+            if oid:
+                ts_cancel_order(oid, account_id=acct)
+                cancelled += 1
+        return cancelled
+    except Exception as e:
+        print(f"[TOPSTEP] Cancel all orders error: {e}")
+        return 0
+
 def ts_cancel_order(order_id, account_id=None):
     """Cancel an open order."""
     acct = account_id or TOPSTEP_ACCOUNT_ID
@@ -2862,7 +2894,6 @@ def check_live_trade():
     Called every 10s when TRADING_MODE=live.
     Monitors price vs TP levels — places partial close orders at each TP.
     Handles: TP1 close c1 → TP2 close c2 + cancel SL + place SL at BE → TP3 close c3.
-    Falls back to Supabase update + Telegram just like paper mode.
     """
     if TRADING_MODE != "live":
         return
@@ -2872,6 +2903,30 @@ def check_live_trade():
 
     price = get_live_price()
     if not price:
+        return
+
+    # ── Sync check: verify position still exists on Topstep ──────────
+    real_pos = ts_get_open_position()
+    if not real_pos:
+        # Position gone (SL hit, manual close, etc.) — figure out result from price
+        tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
+        hit_sl  = (s["side"]=="BUY" and price <= s["sl"])  or (s["side"]=="SELL" and price >= s["sl"])
+        hit_tp3 = (s["side"]=="BUY" and price >= s["tp3"]) or (s["side"]=="SELL" and price <= s["tp3"])
+        if tp2h:
+            result = "WIN"
+        elif tp1h:
+            result = "WIN"
+        elif hit_tp3:
+            result = "WIN"
+        else:
+            result = "LOSS"
+        # Cancel any dangling SL order
+        if s["sl_order_id"]:
+            ts_cancel_order(s["sl_order_id"])
+        pnl = calc_scaled_pnl(s["entry"], s["side"], s["tp1"], s["tp2"], s["tp3"],
+                               s["sl"], s["contracts"], tp1h, tp2h, hit_tp3, not hit_tp3 and not hit_tp3)
+        tg_send(f"⚠️ <b>Position closed externally</b> — syncing Jarvis state.\nResult: {result}  |  P&L: ${pnl:+,.2f}")
+        _resolve_live_trade(result, tp1h, tp2h, hit_tp3, not (tp1h or tp2h or hit_tp3), pnl)
         return
 
     side  = s["side"]
@@ -2981,14 +3036,21 @@ def _resolve_live_trade(result, tp1h, tp2h, tp3h, slh, pnl_usd):
         _last_sl["side"]  = s["side"]
         _last_sl["time"]  = time.time()
 
-    ev = get_eval_status()
     emoji = "✅" if result == "WIN" else "❌"
     tps = " → ".join([x for x, h in [("TP1", tp1h), ("TP2", tp2h), ("TP3", tp3h)] if h])
+    # Pull real balance from Topstep
+    real_bal_str = ""
+    try:
+        bal = ts_get_balance()
+        if bal:
+            real_bal_str = f"\n🏦 Topstep balance: ${float(bal.get('balance',0)):,.2f}"
+    except:
+        pass
     tg_send(
         f"{emoji} <b>LIVE CLOSE — #{s['trade_id']}</b>  ({result})\n\n"
         f"{s['side']} {s['contracts']}MNQ  |  {tps or 'SL'}\n"
-        f"P&L: <b>{'+'if pnl_usd>=0 else ''}${pnl_usd:,.2f}</b>\n\n"
-        f"🏦 Topstep balance: ${ev['eval_balance']:,.2f}"
+        f"P&L: <b>{'+'if pnl_usd>=0 else ''}${pnl_usd:,.2f}</b>"
+        f"{real_bal_str}"
     )
 
     # Clear live state
@@ -3081,11 +3143,89 @@ def handle_balance_command():
     lines.append(f"Daily loss limit per account: −${DAILY_LOSS_LIMIT:,.0f}")
     tg_send("\n".join(lines))
 
+# ── /breakeven — move SL to entry price ──────────────────────────
+def handle_breakeven_command():
+    s = _live_trade_state
+    if not s["trade_id"] or not s["side"]:
+        tg_send("No active trade to move SL on.")
+        return
+    entry      = s["entry"]
+    c_remaining = s["c3"] if s["tp2_hit"] else (s["c2"] + s["c3"]) if s["tp1_hit"] else s["contracts"]
+    close_side  = "Sell" if s["side"] == "BUY" else "Buy"
+    # Cancel old SL
+    if s["sl_order_id"]:
+        ts_cancel_order(s["sl_order_id"])
+    # Place new SL at entry
+    new_sl_id = ts_place_order(close_side, c_remaining, "Stop", stop_price=entry)
+    if new_sl_id:
+        s["sl_order_id"] = new_sl_id
+        s["sl"]          = entry
+        sb_update("trades", s["trade_id"], {"sl": entry})
+        tg_send(
+            f"✅ <b>Stop moved to breakeven</b>\n"
+            f"SL → <code>{entry}</code>  |  {c_remaining}MNQ protected  |  order#{new_sl_id}"
+        )
+    else:
+        tg_send("⚠️ Failed to place breakeven SL — check Topstep manually!")
+
+# ── /close — emergency close entire position ──────────────────────
+def handle_close_command():
+    s = _live_trade_state
+    if not s["trade_id"] or not s["side"]:
+        # Try to close any real position even if state is gone
+        real_pos = ts_get_open_position()
+        cancelled = ts_cancel_all_orders()
+        if real_pos:
+            net = int(real_pos.get("netPos", 0) or 0)
+            size       = abs(net)
+            close_side = "Sell" if net > 0 else "Buy"
+            ts_place_order(close_side, size, "Market")
+            tg_send(f"🔴 <b>Position closed</b> — {size}MNQ @ market\n{cancelled} pending orders cancelled")
+        elif cancelled:
+            tg_send(f"No open position — cancelled {cancelled} dangling orders.")
+        else:
+            tg_send("No active trade, open position, or pending orders found.")
+        return
+
+    close_side = "Sell" if s["side"] == "BUY" else "Buy"
+    remaining  = s["c3"] if s["tp2_hit"] else (s["c2"]+s["c3"]) if s["tp1_hit"] else s["contracts"]
+    price      = get_live_price() or 0
+
+    # Cancel SL
+    if s["sl_order_id"]:
+        ts_cancel_order(s["sl_order_id"])
+    # Market close remaining
+    oid = ts_place_order(close_side, remaining, "Market")
+    if oid:
+        tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
+        pnl  = calc_scaled_pnl(s["entry"], s["side"], s["tp1"], s["tp2"], s["tp3"],
+                                s["sl"], s["contracts"], tp1h, tp2h, False, False)
+        result = "WIN" if pnl >= 0 else "LOSS"
+        # Real balance
+        bal_str = ""
+        try:
+            bal = ts_get_balance()
+            if bal:
+                bal_str = f"\n🏦 Balance: ${float(bal.get('balance',0)):,.2f}"
+        except:
+            pass
+        tg_send(
+            f"🔴 <b>POSITION CLOSED</b> — manual\n\n"
+            f"{s['side']} {remaining}MNQ @ market (~<code>{price}</code>)\n"
+            f"Est. P&L: ${pnl:+,.2f}  |  order#{oid}"
+            f"{bal_str}"
+        )
+        _resolve_live_trade(result, tp1h, tp2h, False, False, pnl)
+    else:
+        tg_send("⚠️ Close order FAILED — check Topstep immediately!")
+
 # ── Wire /yes /no /accounts /balance /setaccount into commands ───
 COMMANDS.setdefault("⚙️ Admin", []).extend([
-    ("/accounts", "List all Topstep funded accounts + balances"),
-    ("/balance",  "Live Topstep balance, today's P&L, daily limit status"),
+    ("/accounts",  "List all Topstep funded accounts + balances"),
+    ("/balance",   "Live Topstep balance, today's P&L, daily limit status"),
     ("/setaccount","Switch active account: /setaccount <id>"),
+    ("/breakeven", "Move stop loss to entry price (protect profits)"),
+    ("/close",     "Emergency close entire position at market"),
 ])
 
 def _start_threads():
