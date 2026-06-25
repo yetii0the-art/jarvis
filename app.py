@@ -562,21 +562,19 @@ def handle_tg_command(text):
         tp1  = round(price + 34, 2)
         tp2  = round(price + 65, 2)
         tp3  = round(price + 100, 2)
-        tg_send(f"🧪 Test BUY 5 MNQ @ market\nSL:{sl}  TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+        tg_send(f"🧪 Test BUY 5 MNQ @ market\nSL:{sl} (monitored)  TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
         entry_oid = ts_place_order("Buy", 5, "Market")
         if entry_oid:
-            sl_oid  = ts_place_order("Sell", 5, "Stop",  stop_price=sl)
             tp1_oid = ts_place_order("Sell", 3, "Limit", price=tp1)
             tp2_oid = ts_place_order("Sell", 1, "Limit", price=tp2)
             tp3_oid = ts_place_order("Sell", 1, "Limit", price=tp3)
             tg_send(
                 f"✅ <b>Test bracket placed</b>\n"
                 f"Entry: <code>{entry_oid}</code>\n"
-                f"SL:  <code>{sl_oid  or 'FAILED'}</code> @ {sl}\n"
                 f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c)\n"
                 f"TP2: <code>{tp2_oid or 'FAILED'}</code> @ {tp2} (1c)\n"
                 f"TP3: <code>{tp3_oid or 'FAILED'}</code> @ {tp3} (1c)\n"
-                f"Use /close to exit all."
+                f"SL @ {sl} monitored by Jarvis — /close to exit all."
             )
         else:
             tg_send("❌ Test BUY failed — check logs.")
@@ -2846,17 +2844,14 @@ def ts_enter_trade(signal):
         return None
     time.sleep(1)  # brief wait for fill
 
-    # ── Step 2: Hard stop-loss (full size) ────────────────────────
-    sl_order_id = ts_place_order(ts_sl_side, contracts, "Stop", stop_price=sl)
-    if not sl_order_id:
-        ts_close_position(contracts, side)
-        tg_send("🚨 <b>SL ORDER FAILED — emergency closed position.</b> Check account.")
-        return None
-
-    # ── Step 3: TP limit orders (c1 @ TP1, c2 @ TP2, c3 @ TP3) ──
+    # ── Step 2: TP limit orders (live on Topstep's servers) ──────────
+    # SL is NOT placed as an order — Topstep rejects it when TPs already
+    # cover the full position size (no-hedging rule). Jarvis monitors SL
+    # every 10s and cancels TPs + market closes if price hits SL level.
     tp1_order_id = ts_place_order(ts_sl_side, c1, "Limit", price=tp1)
     tp2_order_id = ts_place_order(ts_sl_side, c2, "Limit", price=tp2)
     tp3_order_id = ts_place_order(ts_sl_side, c3, "Limit", price=tp3)
+    sl_order_id  = None  # monitored in software
     failed_tps = [lvl for lvl, oid in [("TP1", tp1_order_id), ("TP2", tp2_order_id), ("TP3", tp3_order_id)] if not oid]
     if failed_tps:
         tg_send(f"⚠️ <b>TP orders failed: {', '.join(failed_tps)}</b> — position is live, manage manually.")
@@ -3012,19 +3007,27 @@ def check_live_trade():
         _resolve_live_trade("WIN", True, True, True, False, pnl)
         return
 
-    # ── SL hit ────────────────────────────────────────────────────
+    # ── SL hit — cancel all live TP orders, market close remaining ───
     if hit_sl and not hit_tp3:
-        # Position was closed by the SL order on Topstep's side
-        # Just resolve the Supabase record
         tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
+        # Cancel any unfilled TP orders still on the exchange
+        for tp_key in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
+            oid = s.get(tp_key)
+            if oid:
+                ts_cancel_order(oid)
+        # Close remaining contracts at market
+        remaining = c3 if tp2h else (c2 + c3) if tp1h else contracts
+        if remaining > 0:
+            ts_place_order(close_side, remaining, "Market")
         if tp2h:
-            result = "WIN"  # SL was at BE, so we're guaranteed +
+            result = "WIN"
         elif tp1h:
-            result = "WIN"  # TP1 profit - remaining loss = still positive
+            result = "WIN"
         else:
             result = "LOSS"
         pnl = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, s["contracts"],
                                tp1h, tp2h, False, True)
+        tg_send(f"🛑 <b>SL hit @ {sl}</b> — closed {remaining}MNQ @ market\nResult: {result}  P&L: ${pnl:+,.2f}")
         _resolve_live_trade(result, tp1h, tp2h, False, True, pnl)
 
 def _resolve_live_trade(result, tp1h, tp2h, tp3h, slh, pnl_usd):
