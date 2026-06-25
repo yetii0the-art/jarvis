@@ -600,6 +600,10 @@ def handle_tg_command(text):
         else:
             tg_send("❌ Test BUY failed — check logs.")
 
+    # ── /lockin — move SL to TP1 price ───────────────────────────────
+    elif cmd in ("/lockin", "lockin", "lock", "lock in"):
+        handle_lockin_command()
+
     # ── /breakeven — move stop to entry ──────────────────────────────
     elif cmd in ("/breakeven", "breakeven", "be"):
         handle_breakeven_command()
@@ -2714,7 +2718,7 @@ def ts_place_order(side, contracts, order_type="Market", price=None,
         "contractId": PROJECTX_SYMBOL,
         "side":       ORDER_SIDE.get(side, 0),
         "type":       ORDER_TYPE.get(order_type, 1),
-        "size":       contracts,
+        "size":       int(contracts),
     }
     if price:
         payload["limitPrice"] = price
@@ -3025,9 +3029,15 @@ def check_live_trade():
             s["sl_order_id"] = new_sl_id
             s["sl"]          = locked_sl
             sb_update("trades", s["trade_id"], {"tp1_hit": True, "tp2_hit": True, "sl": locked_sl})
+            tp1_usd = round(34*PTS_TO_USD*c1)
+            tp2_usd = round(65*PTS_TO_USD*c2)
+            tp3_usd = round(100*PTS_TO_USD*c3)
             tg_send(
-                f"⚡ <b>TP2</b> — {c2}MNQ @ market (~<code>{tp2}</code>)  +${round(65*PTS_TO_USD*c2)}\n"
-                f"SL locked @ TP1 <code>{locked_sl}</code>  |  {c3}c free-rolling to TP3 <code>{tp3}</code>"
+                f"⚡ <b>TP2 HIT — SL locked @ TP1</b>\n\n"
+                f"Closed {c2}MNQ @ ~<code>{tp2}</code>  +${tp2_usd}\n"
+                f"SL → <code>{locked_sl}</code>  (worst case: +${tp1_usd+tp2_usd} total)\n"
+                f"TP3 @ <code>{tp3}</code>  (best case: +${tp1_usd+tp2_usd+tp3_usd} total)\n\n"
+                f"🔒 Profit locked  |  /close to exit now  |  let it ride to TP3"
             )
 
     # ── TP3 hit — market close c3, cancel SL, resolve ─────────────────
@@ -3203,6 +3213,33 @@ def handle_balance_command():
     lines.append(f"Daily loss limit per account: −${DAILY_LOSS_LIMIT:,.0f}")
     tg_send("\n".join(lines))
 
+# ── /lockin — move SL to TP1 price (lock profit after TP2) ──────
+def handle_lockin_command():
+    s = _live_trade_state
+    if not s["trade_id"] or not s["side"]:
+        tg_send("No active trade.")
+        return
+    if not s["tp1_hit"]:
+        tg_send("TP1 hasn't hit yet — nothing to lock in.")
+        return
+    tp1       = s["tp1"]
+    c_remaining = int(s["c3"] if s["tp2_hit"] else s["c3"])
+    close_side  = "Sell" if s["side"] == "BUY" else "Buy"
+    if s["sl_order_id"]:
+        ts_cancel_order(s["sl_order_id"])
+    new_sl_id = ts_place_order(close_side, c_remaining, "Stop", stop_price=tp1)
+    if new_sl_id:
+        s["sl_order_id"] = new_sl_id
+        s["sl"]          = tp1
+        sb_update("trades", s["trade_id"], {"sl": tp1})
+        tg_send(
+            f"🔒 <b>SL locked at TP1</b>\n"
+            f"Stop → <code>{tp1}</code>  |  {c_remaining}MNQ  |  profit guaranteed\n"
+            f"order#{new_sl_id}"
+        )
+    else:
+        tg_send("⚠️ Failed to place lock-in SL — check Topstep!")
+
 # ── /breakeven — move SL to entry price ──────────────────────────
 def handle_breakeven_command():
     s = _live_trade_state
@@ -3231,60 +3268,46 @@ def handle_breakeven_command():
 # ── /close — emergency close entire position ──────────────────────
 def handle_close_command():
     s = _live_trade_state
-    if not s["trade_id"] or not s["side"]:
-        # Try to close any real position even if state is gone
-        real_pos = ts_get_open_position()
-        cancelled = ts_cancel_all_orders()
-        if real_pos:
-            net = int(real_pos.get("netPos", 0) or 0)
-            size       = abs(net)
-            close_side = "Sell" if net > 0 else "Buy"
-            ts_place_order(close_side, size, "Market")
-            tg_send(f"🔴 <b>Position closed</b> — {size}MNQ @ market\n{cancelled} pending orders cancelled")
-        elif cancelled:
-            tg_send(f"No open position — cancelled {cancelled} dangling orders.")
+
+    # Step 1: always cancel all open orders first
+    cancelled = ts_cancel_all_orders()
+
+    # Step 2: get real position from Topstep
+    real_pos = ts_get_open_position()
+    if real_pos:
+        # Try all known field names for position size
+        net = int(real_pos.get("netPos") or real_pos.get("size") or real_pos.get("qty") or 0)
+        if net == 0:
+            # fallback: use Jarvis state
+            net = s["contracts"] if s["side"] == "BUY" else -s["contracts"]
+        size       = abs(net)
+        close_side = "Sell" if net > 0 else "Buy"
+        price      = get_live_price() or 0
+        oid = ts_place_order(close_side, size, "Market")
+        if oid:
+            tg_send(f"🔴 <b>CLOSED</b> — {size}MNQ {close_side} @ market (~{price})\n{cancelled} orders cancelled")
         else:
-            tg_send("No active trade, open position, or pending orders found.")
-        return
-
-    close_side = "Sell" if s["side"] == "BUY" else "Buy"
-    remaining  = s["c3"] if s["tp2_hit"] else (s["c2"]+s["c3"]) if s["tp1_hit"] else s["contracts"]
-    price      = get_live_price() or 0
-
-    # Cancel SL
-    if s["sl_order_id"]:
-        ts_cancel_order(s["sl_order_id"])
-    # Market close remaining
-    oid = ts_place_order(close_side, remaining, "Market")
-    if oid:
-        tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
-        pnl  = calc_scaled_pnl(s["entry"], s["side"], s["tp1"], s["tp2"], s["tp3"],
-                                s["sl"], s["contracts"], tp1h, tp2h, False, False)
-        result = "WIN" if pnl >= 0 else "LOSS"
-        # Real balance
-        bal_str = ""
-        try:
-            bal = ts_get_balance()
-            if bal:
-                bal_str = f"\n🏦 Balance: ${float(bal.get('balance',0)):,.2f}"
-        except:
-            pass
-        tg_send(
-            f"🔴 <b>POSITION CLOSED</b> — manual\n\n"
-            f"{s['side']} {remaining}MNQ @ market (~<code>{price}</code>)\n"
-            f"Est. P&L: ${pnl:+,.2f}  |  order#{oid}"
-            f"{bal_str}"
-        )
-        _resolve_live_trade(result, tp1h, tp2h, False, False, pnl)
+            tg_send(f"⚠️ Close order FAILED — {size}MNQ {close_side}. Cancel {cancelled} orders. Check Topstep NOW.")
+    elif cancelled:
+        tg_send(f"No open position found — cancelled {cancelled} dangling orders. Clean.")
     else:
-        tg_send("⚠️ Close order FAILED — check Topstep immediately!")
+        tg_send("No position or pending orders found — already clean.")
+
+    # Step 3: if Jarvis thinks it's in a trade, resolve it
+    if s["trade_id"] and s["side"]:
+        tp1h = s["tp1_hit"]; tp2h = s["tp2_hit"]
+        price = get_live_price() or 0
+        pnl   = calc_scaled_pnl(s["entry"], s["side"], s["tp1"], s["tp2"], s["tp3"],
+                                 s["sl"], s["contracts"], tp1h, tp2h, False, False)
+        _resolve_live_trade("WIN" if pnl >= 0 else "LOSS", tp1h, tp2h, False, False, pnl)
 
 # ── Wire /yes /no /accounts /balance /setaccount into commands ───
 COMMANDS.setdefault("⚙️ Admin", []).extend([
     ("/accounts",  "List all Topstep funded accounts + balances"),
     ("/balance",   "Live Topstep balance, today's P&L, daily limit status"),
     ("/setaccount","Switch active account: /setaccount <id>"),
-    ("/breakeven", "Move stop loss to entry price (protect profits)"),
+    ("/lockin",    "Move SL to TP1 price — lock guaranteed profit"),
+    ("/breakeven", "Move SL to entry price (break even protection)"),
     ("/close",     "Emergency close entire position at market"),
 ])
 
