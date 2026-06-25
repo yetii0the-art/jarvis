@@ -555,19 +555,28 @@ def handle_tg_command(text):
             _save_account_id(new_id)
             tg_send(f"✅ Active account set to <code>{new_id}</code> — saved permanently.\nSwitch anytime with /setaccount.")
 
-    # ── /testbuy — fire 5 contract market buy with SL (mirrors real trade) ──
+    # ── /testbuy — full bracket: entry + SL + TP1/2/3 (mirrors real trade) ──
     elif cmd == "/testbuy":
         price = get_live_price() or 0
-        sl    = round(price - 40, 2) if price else 0
-        tg_send(f"🧪 Firing test BUY 5 MNQ @ market  SL: {sl}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+        sl   = round(price - 40, 2)
+        tp1  = round(price + 34, 2)
+        tp2  = round(price + 65, 2)
+        tp3  = round(price + 100, 2)
+        tg_send(f"🧪 Test BUY 5 MNQ @ market\nSL:{sl}  TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
         entry_oid = ts_place_order("Buy", 5, "Market")
         if entry_oid:
-            sl_oid = ts_place_order("Sell", 5, "Stop", stop_price=sl) if sl else None
+            sl_oid  = ts_place_order("Sell", 5, "Stop",  stop_price=sl)
+            tp1_oid = ts_place_order("Sell", 3, "Limit", price=tp1)
+            tp2_oid = ts_place_order("Sell", 1, "Limit", price=tp2)
+            tp3_oid = ts_place_order("Sell", 1, "Limit", price=tp3)
             tg_send(
-                f"✅ <b>Test BUY placed</b>\n"
-                f"Entry order: <code>{entry_oid}</code>\n"
-                f"SL order: <code>{sl_oid or 'FAILED'}</code>  @ {sl}\n"
-                f"Use /close to exit."
+                f"✅ <b>Test bracket placed</b>\n"
+                f"Entry: <code>{entry_oid}</code>\n"
+                f"SL:  <code>{sl_oid  or 'FAILED'}</code> @ {sl}\n"
+                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c)\n"
+                f"TP2: <code>{tp2_oid or 'FAILED'}</code> @ {tp2} (1c)\n"
+                f"TP3: <code>{tp3_oid or 'FAILED'}</code> @ {tp3} (1c)\n"
+                f"Use /close to exit all."
             )
         else:
             tg_send("❌ Test BUY failed — check logs.")
@@ -2827,7 +2836,8 @@ def ts_enter_trade(signal):
     ts_side    = "Buy" if side == "BUY" else "Sell"
     ts_sl_side = "Sell" if side == "BUY" else "Buy"
 
-    print(f"[LIVE] Placing {ts_side} {contracts}MNQ — entry market, SL @ {sl}")
+    tp1, tp2, tp3 = signal["tp1"], signal["tp2"], signal["tp3"]
+    print(f"[LIVE] Placing {ts_side} {contracts}MNQ — entry market, SL@{sl}, TP1@{tp1}, TP2@{tp2}, TP3@{tp3}")
 
     # ── Step 1: Market entry ───────────────────────────────────────
     entry_order_id = ts_place_order(ts_side, contracts, "Market")
@@ -2836,16 +2846,20 @@ def ts_enter_trade(signal):
         return None
     time.sleep(1)  # brief wait for fill
 
-    # ── Step 2: Hard stop-loss (full size, stop-market) ───────────
-    sl_order_id = ts_place_order(
-        ts_sl_side, contracts, "Stop",
-        stop_price=sl
-    )
+    # ── Step 2: Hard stop-loss (full size) ────────────────────────
+    sl_order_id = ts_place_order(ts_sl_side, contracts, "Stop", stop_price=sl)
     if not sl_order_id:
-        # Entry is live but SL failed — emergency close
         ts_close_position(contracts, side)
         tg_send("🚨 <b>SL ORDER FAILED — emergency closed position.</b> Check account.")
         return None
+
+    # ── Step 3: TP limit orders (c1 @ TP1, c2 @ TP2, c3 @ TP3) ──
+    tp1_order_id = ts_place_order(ts_sl_side, c1, "Limit", price=tp1)
+    tp2_order_id = ts_place_order(ts_sl_side, c2, "Limit", price=tp2)
+    tp3_order_id = ts_place_order(ts_sl_side, c3, "Limit", price=tp3)
+    failed_tps = [lvl for lvl, oid in [("TP1", tp1_order_id), ("TP2", tp2_order_id), ("TP3", tp3_order_id)] if not oid]
+    if failed_tps:
+        tg_send(f"⚠️ <b>TP orders failed: {', '.join(failed_tps)}</b> — position is live, manage manually.")
 
     # ── Log to Supabase ───────────────────────────────────────────
     bio = build_entry_bio(signal)
@@ -2854,14 +2868,14 @@ def ts_enter_trade(signal):
         "side":          side,
         "entry":         entry,
         "sl":            sl,
-        "tp1":           signal["tp1"],
-        "tp2":           signal["tp2"],
-        "tp3":           signal["tp3"],
+        "tp1":           tp1,
+        "tp2":           tp2,
+        "tp3":           tp3,
         "contracts":     contracts,
         "trader":        "JARVIS",
         "source":        "JARVIS",
         "result":        "OPEN",
-        "notes":         bio + f" | entry_order:{entry_order_id} sl_order:{sl_order_id}",
+        "notes":         bio + f" | entry#{entry_order_id} sl#{sl_order_id} tp1#{tp1_order_id} tp2#{tp2_order_id} tp3#{tp3_order_id}",
     }
     logged = sb_insert("trades", trade_row)
     trade_id = logged["id"] if logged else "?"
@@ -2875,16 +2889,19 @@ def ts_enter_trade(signal):
         f"{'🟢' if side=='BUY' else '🔴'} <b>LIVE ORDER PLACED — #{trade_id}</b>\n\n"
         f"<b>{side} {contracts} MNQ</b>  (real money 💰)\n"
         f"Entry: Market  |  SL: <code>{sl}</code>\n"
-        f"TP1 {c1}c @ <code>{signal['tp1']}</code>  +${tp1_usd}\n"
-        f"TP2 {c2}c @ <code>{signal['tp2']}</code>  +${tp2_usd}  ← SL→BE\n"
-        f"TP3 {c3}c @ <code>{signal['tp3']}</code>  +${tp3_usd}\n"
+        f"TP1 {c1}c @ <code>{tp1}</code>  +${tp1_usd}  {'✅' if tp1_order_id else '⚠️'}\n"
+        f"TP2 {c2}c @ <code>{tp2}</code>  +${tp2_usd}  {'✅' if tp2_order_id else '⚠️'}  ← SL→BE\n"
+        f"TP3 {c3}c @ <code>{tp3}</code>  +${tp3_usd}  {'✅' if tp3_order_id else '⚠️'}\n"
         f"Risk: −${risk_usd}  |  Max: +${tp1_usd+tp2_usd+tp3_usd}\n\n"
-        f"🏦 Balance: ${acct_balance:,.2f}  |  entry#{entry_order_id}  sl#{sl_order_id}"
+        f"🏦 Balance: ${acct_balance:,.2f}"
     )
 
     # Store order IDs in memory for check_live_trade to use
     _live_trade_state["trade_id"]       = trade_id
     _live_trade_state["sl_order_id"]    = sl_order_id
+    _live_trade_state["tp1_order_id"]   = tp1_order_id
+    _live_trade_state["tp2_order_id"]   = tp2_order_id
+    _live_trade_state["tp3_order_id"]   = tp3_order_id
     _live_trade_state["contracts"]      = contracts
     _live_trade_state["c1"]             = c1
     _live_trade_state["c2"]             = c2
@@ -2892,17 +2909,18 @@ def ts_enter_trade(signal):
     _live_trade_state["side"]           = side
     _live_trade_state["entry"]          = entry
     _live_trade_state["sl"]             = sl
-    _live_trade_state["tp1"]            = signal["tp1"]
-    _live_trade_state["tp2"]            = signal["tp2"]
-    _live_trade_state["tp3"]            = signal["tp3"]
+    _live_trade_state["tp1"]            = tp1
+    _live_trade_state["tp2"]            = tp2
+    _live_trade_state["tp3"]            = tp3
     _live_trade_state["tp1_hit"]        = False
     _live_trade_state["tp2_hit"]        = False
     return trade_id
 
 # ── Live trade monitor state ──────────────────────────────────────
 _live_trade_state = {
-    "trade_id": None, "sl_order_id": None, "contracts": 0,
-    "c1": 0, "c2": 0, "c3": 0, "side": None,
+    "trade_id": None, "sl_order_id": None,
+    "tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None,
+    "contracts": 0, "c1": 0, "c2": 0, "c3": 0, "side": None,
     "entry": 0, "sl": 0, "tp1": 0, "tp2": 0, "tp3": 0,
     "tp1_hit": False, "tp2_hit": False
 }
@@ -2961,44 +2979,32 @@ def check_live_trade():
     hit_tp3 = (side=="BUY" and price >= tp3) or (side=="SELL" and price <= tp3)
     hit_sl  = (side=="BUY" and price <= sl)  or (side=="SELL" and price >= sl)
 
-    # ── TP1 ──────────────────────────────────────────────────────
+    # ── TP1 filled (Topstep executed the limit order) ────────────────
     if hit_tp1 and not s["tp1_hit"] and not hit_tp2:
-        print(f"[LIVE] TP1 hit @ {price} — closing {c1} contracts")
-        oid = ts_place_order(close_side, c1, "Market")
-        if oid:
-            s["tp1_hit"] = True
-            sb_update("trades", s["trade_id"], {"tp1_hit": True})
-            tg_send(f"✅ <b>TP1 hit</b> — closed {c1}MNQ @ <code>{tp1}</code>  +${round(34*PTS_TO_USD*c1)}")
+        s["tp1_hit"] = True
+        sb_update("trades", s["trade_id"], {"tp1_hit": True})
+        tg_send(f"✅ <b>TP1 filled</b> — {c1}MNQ closed @ <code>{tp1}</code>  +${round(34*PTS_TO_USD*c1)}")
 
-    # ── TP2 — close c2 + cancel old SL + place new SL at entry (BE) ──
+    # ── TP2 filled — cancel old SL, place new SL at breakeven ────────
     if hit_tp2 and not s["tp2_hit"]:
-        print(f"[LIVE] TP2 hit @ {price} — closing {c2} contracts, moving SL to BE")
-        oid = ts_place_order(close_side, c2, "Market")
-        if oid:
-            # Cancel original SL order
-            if s["sl_order_id"]:
-                ts_cancel_order(s["sl_order_id"])
-            # Place new SL at breakeven (for remaining c3 contracts)
-            be_sl_id = ts_place_order(
-                close_side, c3, "Stop", stop_price=entry
-            )
-            s["tp1_hit"] = True
-            s["tp2_hit"] = True
-            s["sl_order_id"] = be_sl_id
-            s["sl"] = entry
-            sb_update("trades", s["trade_id"], {
-                "tp1_hit": True, "tp2_hit": True, "sl": entry
-            })
-            tg_send(
-                f"⚡ <b>TP2 hit — SL at Breakeven</b>\n"
-                f"Closed {c2}MNQ @ <code>{tp2}</code>  +${round(65*PTS_TO_USD*c2)}\n"
-                f"SL → entry <code>{entry}</code>  |  {c3}MNQ targeting TP3 <code>{tp3}</code>"
-            )
+        if s["sl_order_id"]:
+            ts_cancel_order(s["sl_order_id"])
+        # Cancel TP3 limit order so we can replace SL logic cleanly if needed
+        # (leave TP3 order live — it'll fill on its own)
+        be_sl_id = ts_place_order(close_side, c3, "Stop", stop_price=entry)
+        s["tp1_hit"] = True
+        s["tp2_hit"] = True
+        s["sl_order_id"] = be_sl_id
+        s["sl"] = entry
+        sb_update("trades", s["trade_id"], {"tp1_hit": True, "tp2_hit": True, "sl": entry})
+        tg_send(
+            f"⚡ <b>TP2 filled — SL → Breakeven</b>\n"
+            f"{c2}MNQ closed @ <code>{tp2}</code>  +${round(65*PTS_TO_USD*c2)}\n"
+            f"SL at entry <code>{entry}</code>  |  {c3}MNQ running to TP3 <code>{tp3}</code>"
+        )
 
-    # ── TP3 — close final c3 contracts ────────────────────────────
+    # ── TP3 filled — cancel SL, resolve trade ─────────────────────────
     if hit_tp3:
-        print(f"[LIVE] TP3 hit @ {price} — closing final {c3} contracts")
-        oid = ts_place_order(close_side, c3, "Market")
         if s["sl_order_id"]:
             ts_cancel_order(s["sl_order_id"])
         pnl = calc_scaled_pnl(entry, side, tp1, tp2, tp3, sl, s["contracts"],
