@@ -557,22 +557,22 @@ def handle_tg_command(text):
 
     # ── /testsell — full bracket sell (mirrors real sell trade) ──────
     elif cmd == "/testsell":
-        price = get_live_price() or 0
-        sl   = round(price + 40, 2)
-        tp1  = round(price - 34, 2)
-        tp2  = round(price - 65, 2)
-        tp3  = round(price - 100, 2)
-        tg_send(f"🧪 Test SELL 5 MNQ @ market\nSL:{sl}  TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+        tg_send(f"🧪 Firing test SELL 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
         entry_oid = ts_place_order("Sell", 5, "Market")
         if entry_oid:
+            time.sleep(1)  # wait for fill
+            fill = get_live_price() or 0  # price AFTER fill
+            sl   = round(fill + 40, 2)
+            tp1  = round(fill - 34, 2)
+            tp2  = round(fill - 65, 2)
+            tp3  = round(fill - 100, 2)
             sl_oid  = ts_place_order("Buy", 5, "Stop",  stop_price=sl)
             tp1_oid = ts_place_order("Buy", 3, "Limit", price=tp1)
             tg_send(
-                f"✅ <b>Test SELL bracket placed (cascade)</b>\n"
-                f"Entry: <code>{entry_oid}</code>\n"
+                f"✅ <b>Test SELL bracket</b>  fill ~{fill}\n"
                 f"SL:  <code>{sl_oid  or 'FAILED'}</code> @ {sl} (5c Stop Market)\n"
-                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c Limit)\n"
-                f"TP2+TP3 cascade after fills — /close to exit all."
+                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c)\n"
+                f"TP2:{tp2}  TP3:{tp3} cascade after fills\n/close to exit."
             )
         else:
             tg_send("❌ Test SELL failed — check logs.")
@@ -584,17 +584,22 @@ def handle_tg_command(text):
         tp1  = round(price + 34, 2)
         tp2  = round(price + 65, 2)
         tp3  = round(price + 100, 2)
-        tg_send(f"🧪 Test BUY 5 MNQ @ market\nSL:{sl}  TP1:{tp1}  TP2:{tp2}  TP3:{tp3}\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
+        tg_send(f"🧪 Firing test BUY 5 MNQ @ market...\nAccount: <code>{TOPSTEP_ACCOUNT_ID}</code>")
         entry_oid = ts_place_order("Buy", 5, "Market")
         if entry_oid:
+            time.sleep(1)  # wait for fill
+            fill = get_live_price() or 0  # price AFTER fill
+            sl   = round(fill - 40, 2)
+            tp1  = round(fill + 34, 2)
+            tp2  = round(fill + 65, 2)
+            tp3  = round(fill + 100, 2)
             sl_oid  = ts_place_order("Sell", 5, "Stop",  stop_price=sl)
             tp1_oid = ts_place_order("Sell", 3, "Limit", price=tp1)
             tg_send(
-                f"✅ <b>Test bracket placed (cascade)</b>\n"
-                f"Entry: <code>{entry_oid}</code>\n"
+                f"✅ <b>Test BUY bracket</b>  fill ~{fill}\n"
                 f"SL:  <code>{sl_oid  or 'FAILED'}</code> @ {sl} (5c Stop Market)\n"
-                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c Limit)\n"
-                f"TP2+TP3 cascade after fills — /close to exit all."
+                f"TP1: <code>{tp1_oid or 'FAILED'}</code> @ {tp1} (3c)\n"
+                f"TP2:{tp2}  TP3:{tp3} cascade after fills\n/close to exit."
             )
         else:
             tg_send("❌ Test BUY failed — check logs.")
