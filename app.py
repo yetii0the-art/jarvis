@@ -2792,8 +2792,8 @@ def ts_cancel_order(order_id, account_id=None):
     except:
         return False
 
-def ts_close_position(contracts, side, account_id=None):
-    """Partial close N contracts using the dedicated endpoint."""
+def ts_close_position(contracts, side=None, account_id=None):
+    """Close N contracts via Topstep's endpoint — no direction needed."""
     acct = account_id or TOPSTEP_ACCOUNT_ID
     hdrs = ts_headers()
     if not hdrs or not acct:
@@ -3272,33 +3272,26 @@ def handle_close_command():
     # Step 1: always cancel all open orders first
     cancelled = ts_cancel_all_orders()
 
-    # Step 2: get real position from Topstep
+    # Step 2: use Topstep's partialCloseContract — no direction needed
     real_pos = ts_get_open_position()
     if real_pos:
-        print(f"[CLOSE] Position raw: {real_pos}")
-        # Size — try signed netPos first, fallback to abs fields
-        raw_net  = real_pos.get("netPos") or real_pos.get("netSize") or 0
-        size     = abs(int(raw_net))
-        if size == 0:
-            size = abs(int(real_pos.get("size") or real_pos.get("qty") or s.get("contracts") or 0))
-        # Direction — use position side field; netPos sign; or Jarvis state
-        pos_side = str(real_pos.get("side") or "").lower()
-        if pos_side in ("long", "buy", "0"):
-            close_side = "Sell"
-        elif pos_side in ("short", "sell", "1"):
-            close_side = "Buy"
-        elif int(raw_net or 0) < 0:
-            close_side = "Buy"   # negative netPos = short → close with buy
-        elif s.get("side"):
-            close_side = "Sell" if s["side"] == "BUY" else "Buy"
-        else:
-            close_side = "Sell" if int(raw_net or 0) >= 0 else "Buy"
+        raw = real_pos.get("netPos") or real_pos.get("size") or real_pos.get("qty") or 0
+        size = abs(int(raw)) or abs(int(s.get("contracts") or 0))
         price = get_live_price() or 0
-        oid = ts_place_order(close_side, size, "Market")
-        if oid:
-            tg_send(f"🔴 <b>CLOSED</b> — {size}MNQ {close_side} @ market (~{price})\n{cancelled} orders cancelled")
+        ok = ts_close_position(size, None)
+        if ok:
+            tg_send(f"🔴 <b>CLOSED</b> — {size}MNQ @ market (~{price})\n{cancelled} orders cancelled")
         else:
-            tg_send(f"⚠️ Close order FAILED — {size}MNQ {close_side}. {cancelled} orders cancelled. Check Topstep NOW.")
+            # fallback: try market order using Jarvis state for direction
+            if s.get("side"):
+                close_side = "Sell" if s["side"] == "BUY" else "Buy"
+                oid = ts_place_order(close_side, size, "Market")
+                if oid:
+                    tg_send(f"🔴 <b>CLOSED</b> — {size}MNQ @ market (~{price})\n{cancelled} orders cancelled")
+                else:
+                    tg_send(f"⚠️ Close FAILED both methods — check Topstep NOW. {cancelled} orders cancelled.")
+            else:
+                tg_send(f"⚠️ Close FAILED — check Topstep manually. {cancelled} orders cancelled.")
     elif cancelled:
         tg_send(f"No open position found — cancelled {cancelled} dangling orders. Clean.")
     else:
